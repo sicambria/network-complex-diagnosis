@@ -1,23 +1,19 @@
 #!/bin/bash
-# Pre-push hook: extended sensitive-data audit before pushing.
-# Runs the same checks as pre-commit but also scans for:
-#   - any absolute path matching /home/* or /Users/*
-#   - large unintentional files (>1 MB and not binaries)
-#   - config files with secrets
+# Pre-push hook: sensitive-data audit + full test suite.
 set -e
 
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
-
 BLOCKED=0
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo -e "${YELLOW}[PRE-PUSH] Scanning for sensitive data...${NC}"
 
-# Check every file that would be pushed
 while read -r local_ref local_sha remote_ref remote_sha; do
     if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
-        continue  # deleting branch
+        continue
     fi
     if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
         range="$local_sha"
@@ -25,14 +21,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         range="$remote_sha..$local_sha"
     fi
 
-    # List files changed in this push
     for file in $(git diff --name-only "$range" 2>/dev/null); do
         if [ ! -f "$file" ]; then
             continue
         fi
+        # Skip hook files — they naturally contain sensitive patterns as detection logic
+        case "$file" in .githooks/*) continue ;; esac
         content=$(git show ":$file" 2>/dev/null || true)
 
-        # 1. Absolute local paths (broader check than pre-commit)
         for bad_path in '/home/' '/Users/' 'C:\\Users\\'; do
             if echo "$content" | grep -q "$bad_path"; then
                 echo -e "${RED}[BLOCKED]${NC} $file contains local path: $bad_path"
@@ -40,7 +36,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             fi
         done
 
-        # 2. Token / secret patterns
         for pat in 'gho_' 'ghp_' 'ghs_' 'sk-' 'xoxp-' 'xoxb-' 'AKIA' '-----BEGIN'; do
             if echo "$content" | grep -q "$pat"; then
                 echo -e "${RED}[BLOCKED]${NC} $file may contain a secret matching: $pat"
@@ -48,15 +43,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             fi
         done
 
-        # 3. Large files (>1 MB)
         size=$(git show ":$file" 2>/dev/null | wc -c || echo 0)
         if [ "$size" -gt 1048576 ]; then
             ext="${file##*.}"
             case "$ext" in
-                png|jpg|jpeg|gif|webp|mp4|mov|mp3|wav|zip|tar|gz|bz2|7z|pdf|dmg|iso)
-                    ;;
+                png|jpg|jpeg|gif|webp|mp4|mov|mp3|wav|zip|tar|gz|bz2|7z|pdf|dmg|iso) ;;
                 *)
-                    echo -e "${YELLOW}[WARN]${NC} $file is ${size} bytes (unusually large text file)"
+                    echo -e "${YELLOW}[WARN]${NC} $file is ${size} bytes (large text file)"
                     ;;
             esac
         fi
@@ -68,4 +61,14 @@ if [ "$BLOCKED" -eq 1 ]; then
     exit 1
 fi
 
-echo -e "\e[32m[PRE-PUSH] Clean.\e[0m"
+echo -e "${YELLOW}[PRE-PUSH] Running test suite...${NC}"
+cd "$SCRIPT_DIR"
+python3 -m pytest tests/ -x --tb=short -q 2>&1 | tail -20
+PYTEST_EXIT=${PIPESTATUS[0]}
+
+if [ "$PYTEST_EXIT" -ne 0 ]; then
+    echo -e "${RED}[PRE-PUSH] Some tests failed (exit code $PYTEST_EXIT). Push rejected.${NC}"
+    exit 1
+fi
+
+echo -e "\e[32m[PRE-PUSH] All tests passed.\e[0m"

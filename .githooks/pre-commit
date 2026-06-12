@@ -1,19 +1,17 @@
 #!/bin/bash
-# Pre-commit hook: block commits containing sensitive / host-specific data.
-# Patterns checked: local absolute paths, hostname, username, env tokens.
+# Pre-commit hook: sensitive-data scan + syntax check.
 set -e
 
 RED='\033[0;31m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
+BLOCKED=0
 
 SENSITIVE_PATTERNS=(
-    # Local absolute paths (Linux, macOS, Windows)
     '/home/arsvivendi'
     '/Users/arsvivendi'
     "C:\\\\Users\\\\arsvivendi"
-    # Hostname
     'venividivici'
-    # Environment tokens / secrets
     'gho_'
     'ghp_'
     'ghs_'
@@ -23,13 +21,12 @@ SENSITIVE_PATTERNS=(
     'AKIA'
 )
 
-BLOCKED=0
-
-# Only check staged files
 while IFS= read -r -d '' file; do
     if [ ! -f "$file" ]; then
         continue
     fi
+    # Skip hook files — they naturally contain sensitive patterns as detection logic
+    case "$file" in .githooks/*) continue ;; esac
     for pattern in "${SENSITIVE_PATTERNS[@]}"; do
         if git show ":$file" 2>/dev/null | grep -q "$pattern"; then
             echo -e "${RED}[BLOCKED]${NC} $file contains sensitive pattern: $pattern"
@@ -38,7 +35,24 @@ while IFS= read -r -d '' file; do
     done
 done < <(git diff --cached --name-only -z)
 
+echo -e "${YELLOW}[PRE-COMMIT] Running syntax check...${NC}"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$SCRIPT_DIR"
+
+python3 -c "
+import py_compile
+import sys
+try:
+    py_compile.compile('netdiag.py', doraise=True)
+    print('  [OK] netdiag.py syntax')
+except py_compile.PyCompileError as e:
+    print(f'  [FAIL] netdiag.py: {e}')
+    sys.exit(1)
+" || BLOCKED=1
+
 if [ "$BLOCKED" -eq 1 ]; then
-    echo -e "${RED}Commit rejected. Remove sensitive data and try again.${NC}"
+    echo -e "${RED}Commit rejected. Fix errors and try again.${NC}"
     exit 1
 fi
+
+echo -e "\e[32m[PRE-COMMIT] OK.\e[0m"
