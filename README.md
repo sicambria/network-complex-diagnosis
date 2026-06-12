@@ -18,9 +18,11 @@ Diagnosis:
 
 ## Quick Start
 
+### Linux / macOS
 ```bash
-# Install system deps + optional GUI
-make install
+make install                    # system deps + GUI + desktop icon
+# or
+bash install.sh                 # same, interactive
 
 # CLI diagnostic (zero deps)
 python3 netdiag.py
@@ -36,6 +38,20 @@ python3 netdiag.py --daemon
 
 # Run tests
 make test
+```
+
+### Windows
+```batch
+:: Double-click install.bat  or  run from cmd:
+install.bat
+
+:: CLI diagnostic
+python3 netdiag.py
+
+:: Web GUI
+python3 netdiag.py --gui
+
+:: Desktop shortcuts will be in Start Menu > NetDiag
 ```
 
 ## Features
@@ -133,16 +149,36 @@ Sessions are also saved to `~/.netdiag/session_*.json` for GUI history.
 
 ## Install
 
+### Linux
 ```bash
-# One-command setup
-make install
+make install                              # automated (system deps + GUI + desktop icon)
+# or
+bash install.sh                           # interactive, same result
+pip install fastapi uvicorn               # optional, for GUI
+sudo ln -sf "$(pwd)/netdiag.py" /usr/local/bin/netdiag  # symlink to PATH
+```
 
-# Or step by step
-bash install.sh
-pip install fastapi uvicorn   # optional, for GUI
+### macOS
+```bash
+bash install.sh                           # Homebrew + pip + desktop .app bundle
+pip install fastapi uvicorn               # optional, for GUI
+sudo ln -sf "$(pwd)/netdiag.py" /usr/local/bin/netdiag  # symlink to PATH
+```
 
-# Create symlink
-sudo ln -sf "$(pwd)/netdiag.py" /usr/local/bin/netdiag
+### Windows
+```batch
+:: Double-click install.bat (at project root)  or run from cmd:
+install.bat
+
+:: Or run the setup script directly:
+setup\windows\install.bat
+
+:: Optional system tools (install manually):
+::   speedtest-cli: https://www.speedtest.net/apps/cli
+::   iperf3:        https://iperf.fr/iperf-download.php
+
+:: Python GUI deps (if skipped during install):
+pip install fastapi uvicorn
 ```
 
 ## Tests
