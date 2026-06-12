@@ -1,0 +1,110 @@
+.PHONY: all install install-sys install-gui desktop-install test venv gui daemon run clean lint \
+        e2e e2e-browser e2e-stress e2e-smoke install-e2e e2e-req
+
+PYTHON := python3
+SCRIPT := netdiag.py
+VENV := .venv
+HISTDIR := $(HOME)/.netdiag
+
+all: install
+
+# -- One-click setup -----------------------------------------------------------
+
+install: install-sys install-gui desktop-install
+	chmod +x $(SCRIPT)
+	mkdir -p $(HISTDIR)
+	@echo ""
+	@echo "NetDiag ready. Usage:"
+	@echo "  $(PYTHON) $(SCRIPT)              # CLI diagnostic"
+	@echo "  $(PYTHON) $(SCRIPT) --gui        # web UI at http://localhost:8080"
+	@echo "  make gui                         # same"
+	@echo "  make test                        # run tests"
+
+install-sys:
+ifeq ($(shell uname -s),Linux)
+	@echo "[install-sys] Installing system dependencies..."
+	command -v apt >/dev/null && sudo apt update -qq && sudo apt install -y -qq \
+		iputils-ping iproute2 iw mtr-tiny speedtest-cli ethtool iperf3 2>/dev/null || true
+	command -v dnf >/dev/null && sudo dnf install -y iputils iproute iw mtr speedtest-cli ethtool iperf3 2>/dev/null || true
+	command -v pacman >/dev/null && sudo pacman -S --noconfirm iputils iproute2 iw mtr speedtest-cli ethtool iperf3 2>/dev/null || true
+else ifeq ($(shell uname -s),Darwin)
+	@echo "[install-sys] Installing macOS dependencies..."
+	command -v brew >/dev/null && brew install mtr speedtest-cli iperf3 2>/dev/null || true
+endif
+
+install-gui:
+	@echo "[install-gui] Installing Python deps for GUI..."
+	$(PYTHON) -c "import fastapi" 2>/dev/null || \
+		$(PYTHON) -m pip install --break-system-packages fastapi uvicorn 2>/dev/null || \
+		$(PYTHON) -m pip install --user fastapi uvicorn 2>/dev/null || \
+		$(PYTHON) -m pip install fastapi uvicorn 2>/dev/null || \
+		echo "  Could not install fastapi/uvicorn. Run: $(PYTHON) -m pip install fastapi uvicorn"
+
+desktop-install:
+	@echo "[desktop] Installing start menu and desktop icon..."
+	bash setup/install-desktop.sh
+	@echo ""
+
+# -- Virtual environment -------------------------------------------------------
+
+venv:
+	$(PYTHON) -m venv $(VENV)
+	. $(VENV)/bin/activate && pip install --quiet fastapi uvicorn pytest
+	@echo "Virtual env ready: source $(VENV)/bin/activate"
+
+# -- Development ----------------------------------------------------------------
+
+test:
+	$(PYTHON) -m pytest tests/ -v $(ARGS)
+
+lint:
+	$(PYTHON) -c "import py_compile; py_compile.compile('$(SCRIPT)', doraise=True)" && echo "Syntax OK"
+
+run:
+	$(PYTHON) $(SCRIPT)
+
+gui:
+	$(PYTHON) $(SCRIPT) --gui
+
+daemon:
+	$(PYTHON) $(SCRIPT) --daemon
+
+clean:
+	rm -rf internet_diagnostics/ output/ __pycache__/ .pytest_cache/
+	find . -name '*.pyc' -delete
+	@echo "Cleaned."
+
+# -- Systemd (Linux daemon) ----------------------------------------------------
+
+SERVICE_FILE := $(HOME)/.config/systemd/user/netdiag.service
+
+install-service:
+	mkdir -p $(HOME)/.config/systemd/user
+	sed 's|/usr/bin/python3|$(shell which $(PYTHON))|g; s|/path/to/netdiag.py|$(CURDIR)/$(SCRIPT)|g' \
+		netdiag.service > $(SERVICE_FILE)
+	systemctl --user daemon-reload
+	@echo "Service installed. Start with: systemctl --user start netdiag"
+	@echo "Enable on login: systemctl --user enable netdiag"
+	@echo "View logs: journalctl --user -u netdiag -f"
+
+# -- E2E browser testing (Playwright) -------------------------------------------
+
+install-e2e:
+	$(PYTHON) -m pip install -q -r requirements-dev.txt 2>/dev/null || true
+	$(PYTHON) -m playwright install chromium --with-deps 2>/dev/null || $(PYTHON) -m playwright install chromium 2>/dev/null || true
+	@echo "E2E deps ready."
+
+e2e-browser:
+	$(PYTHON) -m pytest tests/test_e2e_browser.py::TestLiveMonitorBrowser -v -s $(ARGS)
+
+e2e-stress:
+	$(PYTHON) -m pytest tests/test_e2e_browser.py::TestMonitorServerStress -v $(ARGS)
+
+e2e:
+	$(PYTHON) -m pytest tests/test_e2e_browser.py -v -s $(ARGS)
+
+e2e-smoke:
+	NETDIAG_MONITOR_DURATION=15 $(PYTHON) -m pytest tests/test_e2e_browser.py -v -s $(ARGS)
+
+e2e-req:
+	$(PYTHON) -m pytest tests/test_e2e_requirements.py -v $(ARGS)

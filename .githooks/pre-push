@@ -1,0 +1,71 @@
+#!/bin/bash
+# Pre-push hook: extended sensitive-data audit before pushing.
+# Runs the same checks as pre-commit but also scans for:
+#   - any absolute path matching /home/* or /Users/*
+#   - large unintentional files (>1 MB and not binaries)
+#   - config files with secrets
+set -e
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+BLOCKED=0
+
+echo -e "${YELLOW}[PRE-PUSH] Scanning for sensitive data...${NC}"
+
+# Check every file that would be pushed
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        continue  # deleting branch
+    fi
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        range="$local_sha"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    # List files changed in this push
+    for file in $(git diff --name-only "$range" 2>/dev/null); do
+        if [ ! -f "$file" ]; then
+            continue
+        fi
+        content=$(git show ":$file" 2>/dev/null || true)
+
+        # 1. Absolute local paths (broader check than pre-commit)
+        for bad_path in '/home/' '/Users/' 'C:\\Users\\'; do
+            if echo "$content" | grep -q "$bad_path"; then
+                echo -e "${RED}[BLOCKED]${NC} $file contains local path: $bad_path"
+                BLOCKED=1
+            fi
+        done
+
+        # 2. Token / secret patterns
+        for pat in 'gho_' 'ghp_' 'ghs_' 'sk-' 'xoxp-' 'xoxb-' 'AKIA' '-----BEGIN'; do
+            if echo "$content" | grep -q "$pat"; then
+                echo -e "${RED}[BLOCKED]${NC} $file may contain a secret matching: $pat"
+                BLOCKED=1
+            fi
+        done
+
+        # 3. Large files (>1 MB)
+        size=$(git show ":$file" 2>/dev/null | wc -c || echo 0)
+        if [ "$size" -gt 1048576 ]; then
+            ext="${file##*.}"
+            case "$ext" in
+                png|jpg|jpeg|gif|webp|mp4|mov|mp3|wav|zip|tar|gz|bz2|7z|pdf|dmg|iso)
+                    ;;
+                *)
+                    echo -e "${YELLOW}[WARN]${NC} $file is ${size} bytes (unusually large text file)"
+                    ;;
+            esac
+        fi
+    done
+done
+
+if [ "$BLOCKED" -eq 1 ]; then
+    echo -e "${RED}[PRE-PUSH] Push rejected due to sensitive content.${NC}"
+    exit 1
+fi
+
+echo -e "\e[32m[PRE-PUSH] Clean.\e[0m"

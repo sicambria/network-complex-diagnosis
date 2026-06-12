@@ -1,0 +1,44 @@
+#!/bin/bash
+# Pre-commit hook: block commits containing sensitive / host-specific data.
+# Patterns checked: local absolute paths, hostname, username, env tokens.
+set -e
+
+RED='\033[0;31m'
+NC='\033[0m'
+
+SENSITIVE_PATTERNS=(
+    # Local absolute paths (Linux, macOS, Windows)
+    '/home/arsvivendi'
+    '/Users/arsvivendi'
+    "C:\\\\Users\\\\arsvivendi"
+    # Hostname
+    'venividivici'
+    # Environment tokens / secrets
+    'gho_'
+    'ghp_'
+    'ghs_'
+    'sk-'
+    'xoxp-'
+    'xoxb-'
+    'AKIA'
+)
+
+BLOCKED=0
+
+# Only check staged files
+while IFS= read -r -d '' file; do
+    if [ ! -f "$file" ]; then
+        continue
+    fi
+    for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+        if git show ":$file" 2>/dev/null | grep -q "$pattern"; then
+            echo -e "${RED}[BLOCKED]${NC} $file contains sensitive pattern: $pattern"
+            BLOCKED=1
+        fi
+    done
+done < <(git diff --cached --name-only -z)
+
+if [ "$BLOCKED" -eq 1 ]; then
+    echo -e "${RED}Commit rejected. Remove sensitive data and try again.${NC}"
+    exit 1
+fi

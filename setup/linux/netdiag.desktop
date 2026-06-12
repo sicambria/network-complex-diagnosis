@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NetDiag
+GenericName=Internet Diagnostics
+Comment=All-in-one internet diagnostics suite — detects WiFi problems, interface errors, bufferbloat, and ISP routing issues
+Exec=bash %PROJECT_DIR%/setup/linux/netdiag-launcher.sh
+Path=%PROJECT_DIR%
+Icon=network-transmit-receive
+Terminal=false
+StartupNotify=true
+Categories=Network;Utility;System;
+Keywords=internet;diagnostics;network;wifi;ping;mtr;speedtest

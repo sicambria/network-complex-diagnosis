@@ -1,0 +1,16 @@
+#!/bin/bash
+# NetDiag Launcher for macOS
+# Installed by install.sh — launches GUI and opens browser.
+SCRIPT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+SCRIPT="$SCRIPT_DIR/netdiag.py"
+
+if [ ! -f "$SCRIPT" ]; then
+    osascript -e 'display dialog "netdiag.py not found at '"$SCRIPT"'" buttons {"OK"} default button 1 with icon stop'
+    exit 1
+fi
+
+python3 "$SCRIPT" --gui &
+PID=$!
+sleep 2
+open "http://localhost:8080"
+wait $PID
