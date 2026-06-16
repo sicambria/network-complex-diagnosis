@@ -4,7 +4,7 @@ from netdiag import (
     mtr_test, speedtest_result, iperf3_test,
     bufferbloat_test, ethtool_info, tcp_socket_stats,
     download_images_test, http_latency_test, mtu_probe,
-    classify_ping, has_tool, check_tools,
+    _ping_traceroute, classify_ping, has_tool, check_tools,
 )
 
 
@@ -63,6 +63,18 @@ class TestMtr:
             assert result["tool"] == "traceroute"
             assert len(result["hops"]) == 3
 
+    def test_mtr_traceroute_malformed(self):
+        def has_tool_side(name):
+            return name == "traceroute"
+
+        with (
+            patch("netdiag.has_tool", side_effect=has_tool_side),
+            patch("netdiag.run_cmd", return_value=(0, "garbage output", "")),
+        ):
+            result = mtr_test("example.com")
+            assert result["tool"] == "traceroute"
+            assert len(result["hops"]) == 0
+
     def test_mtr_ping_traceroute_fallback(self):
         with (
             patch("netdiag.has_tool", return_value=False),
@@ -70,6 +82,60 @@ class TestMtr:
         ):
             result = mtr_test("example.com")
             assert result["tool"] == "ping_traceroute"
+
+
+class TestPingTraceroute:
+    def test_linux_platform(self):
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.run_cmd", return_value=(0, "64 bytes from 1.1.1.1: icmp_seq=1 ttl=53 time=10.0 ms", "")),
+        ):
+            result = _ping_traceroute("1.1.1.1", max_hops=5)
+            assert result["tool"] == "ping_traceroute"
+            assert len(result["hops"]) >= 1
+
+    def test_macos_platform(self):
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.run_cmd", return_value=(0, "64 bytes from 1.1.1.1: icmp_seq=1 ttl=53 time=10.0 ms", "")),
+        ):
+            result = _ping_traceroute("1.1.1.1", max_hops=3)
+            assert result["tool"] == "ping_traceroute"
+
+    def test_windows_platform(self):
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", True),
+            patch("netdiag.run_cmd", return_value=(0, "Reply from 1.1.1.1: bytes=32 time=10ms", "")),
+        ):
+            result = _ping_traceroute("1.1.1.1", max_hops=3)
+            assert result["tool"] == "ping_traceroute"
+
+    def test_max_hops_reached(self):
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.run_cmd", return_value=(1, "From 10.0.0.1 icmp_seq=1 Time to live exceeded", "")),
+        ):
+            result = _ping_traceroute("1.1.1.1", max_hops=3)
+            assert len(result["hops"]) == 3
+
+    def test_no_hop_ip_rc_not_zero(self):
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.run_cmd", return_value=(1, "", "timeout")),
+        ):
+            result = _ping_traceroute("1.1.1.1", max_hops=2)
+            assert result["hops"][0].get("ip") is None
+            assert result["hops"][0]["loss_pct"] == 100
 
 
 class TestSpeedtest:
@@ -118,6 +184,43 @@ class TestSpeedtest:
             result = speedtest_result()
             assert result.get("error") == "parse failed"
 
+    def test_speedtest_rc_fail(self):
+        with (
+            patch("netdiag.has_tool",
+                  side_effect=lambda x: x == "speedtest"),
+            patch("netdiag.run_cmd",
+                  return_value=(1, "error output", "")),
+        ):
+            result = speedtest_result()
+            assert result.get("rc") == 1
+            assert result.get("tool") == "speedtest"
+
+    def test_speedtest_cli_parse_fail(self):
+        def has_tool_side(name):
+            return name == "speedtest-cli"
+
+        with (
+            patch("netdiag.has_tool", side_effect=has_tool_side),
+            patch("netdiag.run_cmd",
+                  return_value=(0, "{invalid json", "")),
+        ):
+            result = speedtest_result()
+            assert result.get("error") == "parse failed"
+            assert result.get("tool") == "speedtest-cli"
+
+    def test_speedtest_cli_rc_fail(self):
+        def has_tool_side(name):
+            return name == "speedtest-cli"
+
+        with (
+            patch("netdiag.has_tool", side_effect=has_tool_side),
+            patch("netdiag.run_cmd",
+                  return_value=(1, "error", "")),
+        ):
+            result = speedtest_result()
+            assert result.get("rc") == 1
+            assert result.get("tool") == "speedtest-cli"
+
 
 class TestIperf3:
     def test_iperf3_success(self):
@@ -147,6 +250,15 @@ class TestIperf3:
             result = iperf3_test("iperf.example", duration=5)
             assert result["available"] is True
             assert result["rc"] != 0
+
+    def test_iperf3_parse_fail(self):
+        with (
+            patch("netdiag.has_tool", return_value=True),
+            patch("netdiag.run_cmd",
+                  return_value=(0, "{invalid json", "")),
+        ):
+            result = iperf3_test()
+            assert result.get("error") == "parse failed"
 
 
 class TestBufferbloat:
@@ -180,6 +292,72 @@ class TestBufferbloat:
         ):
             result = bufferbloat_test(None)
             assert result["available"] is False
+
+    def test_bufferbloat_non_linux_with_iperf3(self):
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("netdiag.has_tool", return_value=True),
+            patch("netdiag.ping_once", side_effect=[
+                {"rtt_ms": 10.0}, {"rtt_ms": 50.0},
+            ]),
+            patch("netdiag.run_cmd", return_value=(0, "", "")),
+        ):
+            result = bufferbloat_test("en0")
+            assert result["available"] is False
+            assert result.get("ratio") == 5.0
+
+    def test_bufferbloat_non_linux_with_iperf3_no_ratio(self):
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("netdiag.has_tool", return_value=True),
+            patch("netdiag.ping_once", side_effect=[
+                {"rtt_ms": None}, {"rtt_ms": 50.0},
+            ]),
+            patch("netdiag.run_cmd", return_value=(0, "", "")),
+        ):
+            result = bufferbloat_test("en0")
+            assert result.get("ratio") is None
+
+    def test_bufferbloat_tc_failed(self):
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.run_cmd", return_value=(1, "", "error")),
+        ):
+            result = bufferbloat_test("eth0")
+            assert result["available"] is False
+            assert "tc failed" in result.get("reason", "")
+
+    def test_bufferbloat_linux_with_iperf3_ratio(self):
+        tc_out = "backlog 42b drops 155 overlimits 0"
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.has_tool", side_effect=lambda x: x == "tc" or x == "iperf3"),
+            patch("netdiag.run_cmd", side_effect=[
+                (0, tc_out, ""),
+                (0, "", ""),
+            ]),
+            patch("netdiag.ping_once", side_effect=[
+                {"rtt_ms": 10.0}, {"rtt_ms": 30.0},
+            ]),
+        ):
+            result = bufferbloat_test("eth0")
+            assert result["available"] is True
+            assert result["drops"] == 155
+            assert result["ratio"] == 3.0
+
+    def test_bufferbloat_drop_parse_exception(self):
+        tc_out = "backlog 42b drops abc overlimits def"
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.has_tool", side_effect=lambda x: x == "tc"),
+            patch("netdiag.run_cmd", return_value=(0, tc_out, "")),
+        ):
+            result = bufferbloat_test("eth0")
+            assert result["available"] is True
+            assert result["drops"] == 0
+            assert result["overlimits"] == 0
 
 
 class TestEthtool:
@@ -254,6 +432,61 @@ class TestTcpSocketStats:
             result = tcp_socket_stats("en0")
             assert result["available"] is False
 
+    def test_tcp_socket_stats_linux_no_ss_no_proc(self):
+        with (
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.has_tool", return_value=False),
+            patch("netdiag._proc_net_tcp_stats", return_value=None),
+        ):
+            result = tcp_socket_stats("lo")
+            assert result["available"] is False
+            assert "/proc/net/tcp" in result.get("reason", "")
+
+    def test_tcp_socket_stats_macos_with_data(self):
+        out = "tcp   0      0 127.0.0.1:5432  *:*    LISTEN retransmit:0\n"
+        out += "tcp   0      0 127.0.0.1:22    *:*    LISTEN\n"
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.run_cmd", return_value=(0, out, "")),
+        ):
+            result = tcp_socket_stats("lo")
+            assert result["available"] is True
+            assert result["connections"] > 0
+
+    def test_tcp_socket_stats_windows(self):
+        out = "Segments Retransmitted = 3\n"
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", True),
+            patch("netdiag.run_cmd", return_value=(0, out, "")),
+        ):
+            result = tcp_socket_stats("eth0")
+            assert result["available"] is True
+            assert result["total_retransmits"] == 3
+
+    def test_tcp_socket_stats_windows_fails(self):
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", True),
+            patch("netdiag.run_cmd", return_value=(1, "", "error")),
+        ):
+            result = tcp_socket_stats("eth0")
+            assert result["available"] is False
+
+    def test_tcp_socket_stats_macos_nettop_fails(self):
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.run_cmd", return_value=(2, "", "error")),
+        ):
+            result = tcp_socket_stats("en0")
+            assert result["available"] is False
+
 
 class TestClassifyPing:
     def test_clean(self):
@@ -298,6 +531,23 @@ class TestDownloadImages:
             result = download_images_test(count=2, timeout_s=5)
             assert result["available"] is True
 
+    def test_download_images_all_fail(self):
+        mock_future = MagicMock()
+        mock_future.result.return_value = {"ok": False, "error": "timeout", "idx": 0}
+        mock_executor = MagicMock()
+        mock_executor.__enter__.return_value.submit.return_value = mock_future
+        with (
+            patch("concurrent.futures.ThreadPoolExecutor",
+                  return_value=mock_executor),
+            patch("concurrent.futures.as_completed",
+                  side_effect=lambda fs: fs),
+        ):
+            result = download_images_test(count=1, timeout_s=1)
+            assert result["available"] is True
+            assert result["success"] == 0
+            assert result["failures"] > 0
+            assert result["error"] == "All downloads failed"
+
 
 class TestHttpLatency:
     def test_http_latency_basic(self):
@@ -316,6 +566,16 @@ class TestHttpLatency:
             if len(result) > 0:
                 assert result[0].get("available") is True
 
+    def test_http_latency_all_fail(self):
+        with (
+            patch("urllib.request.urlopen") as mock_urlopen,
+        ):
+            mock_urlopen.side_effect = Exception("connection failed")
+            result = http_latency_test(["fail.example"], count=2, timeout_s=1)
+            assert len(result) == 1
+            assert result[0]["failures"] == 2
+            assert result[0].get("avg_ms") is None
+
 
 class TestMtuProbe:
     def test_mtu_probe_available(self):
@@ -333,6 +593,38 @@ class TestMtuProbe:
             result = mtu_probe("1.1.1.1")
             assert result["available"] is False
             assert "ping" in result.get("reason", "")
+
+    def test_mtu_probe_macos(self):
+        def run_cmd_side(*args, **kw):
+            if "ping" in args[0][0] and "-D" in args[0]:
+                if "fail" not in args[0]:
+                    return (0, "64 bytes from 1.1.1.1: icmp_seq=1 ttl=53 time=10.0 ms", "")
+            return (1, "", "")
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("netdiag.IS_WINDOWS", False),
+            patch("netdiag.has_tool", return_value=True),
+            patch("netdiag.run_cmd", side_effect=run_cmd_side),
+        ):
+            result = mtu_probe("1.1.1.1", max_size=100)
+            assert result["available"] is True
+
+    def test_mtu_probe_windows(self):
+        def run_cmd_side(*args, **kw):
+            if "ping" in args[0][0] and "-i" in args[0]:
+                if "fail" not in args[0]:
+                    return (0, "Reply from 1.1.1.1: bytes=32 time=10ms TTL=53", "")
+            return (1, "", "")
+        with (
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", False),
+            patch("netdiag.IS_WINDOWS", True),
+            patch("netdiag.has_tool", return_value=True),
+            patch("netdiag.run_cmd", side_effect=run_cmd_side),
+        ):
+            result = mtu_probe("1.1.1.1", max_size=80)
+            assert result["available"] is True
 
 
 class TestCheckTools:

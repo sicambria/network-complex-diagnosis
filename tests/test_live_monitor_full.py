@@ -3,7 +3,7 @@ import threading
 import time
 
 from netdiag import (
-    monitor_targets, monitor_loop, monitor_start, monitor_stop,
+    monitor_targets, monitor_loop, monitor_start, monitor_stop, monitor_diagnose,
     MONITOR_STATE, MONITOR_LOCK,
 )
 
@@ -488,3 +488,83 @@ class TestMonitorStop:
             mock_thread2.return_value = mock_t2
             result = monitor_start()
         assert result is True
+
+
+class TestMonitorDiagnose:
+    def test_few_samples_returns_empty(self):
+        snapshot = {"sample_count": 3, "targets": {}}
+        assert monitor_diagnose(snapshot) == []
+
+    def test_gateway_jitter_high(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "gateway": {"loss_pct": 0, "jitter_ms": 35},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("jitter" in h["text"] for h in hints)
+
+    def test_gateway_loss_and_external_loss(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "gateway": {"loss_pct": 0},
+                "external:1.1.1.1": {"loss_pct": 10},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("ISP/upstream" in h["text"] for h in hints)
+
+    def test_intermittent_gateway_loss(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "gateway": {"loss_pct": 25},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("cabling" in h["text"] for h in hints)
+
+    def test_dns_loss(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "gateway": {"loss_pct": 0},
+                "dns": {"loss_pct": 30},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("DNS" in h["text"] for h in hints)
+
+    def test_tcp_loss_ping_ok(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "gateway": {"loss_pct": 0},
+                "tcp": {"loss_pct": 50},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("TCP" in h["text"] for h in hints)
+
+    def test_sporadic_loss_no_other_hints(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "external:1.1.1.1": {"loss_pct": 10},
+                "external:8.8.8.8": {"loss_pct": 50},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("Sporadic" in h["text"] for h in hints)
+
+    def test_no_issues_returns_clean(self):
+        snapshot = {
+            "sample_count": 10,
+            "targets": {
+                "gateway": {"loss_pct": 0, "jitter_ms": 10},
+            },
+        }
+        hints = monitor_diagnose(snapshot)
+        assert any("No intermittent" in h["text"] for h in hints)

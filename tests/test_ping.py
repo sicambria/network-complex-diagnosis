@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from netdiag import ping_command, ping_once, _tcp_ping
+from netdiag import ping_command, ping_once, _tcp_ping, parse_rtt_ms
 
 
 class TestPingCommand:
@@ -38,6 +38,26 @@ class TestPingCommand:
 
     def test_ipv6_linux(self):
         with patch("netdiag.IS_LINUX", True), patch("netdiag.IS_MACOS", False), patch("netdiag.IS_WINDOWS", False):
+            cmd = ping_command("1.1.1.1", ipv=6)
+            assert "-6" in cmd
+
+    def test_ipv4_macos(self):
+        with patch("netdiag.IS_LINUX", False), patch("netdiag.IS_MACOS", True), patch("netdiag.IS_WINDOWS", False):
+            cmd = ping_command("1.1.1.1", ipv=4)
+            assert "-4" in cmd
+
+    def test_ipv6_macos(self):
+        with patch("netdiag.IS_LINUX", False), patch("netdiag.IS_MACOS", True), patch("netdiag.IS_WINDOWS", False):
+            cmd = ping_command("1.1.1.1", ipv=6)
+            assert "-6" in cmd
+
+    def test_ipv4_windows(self):
+        with patch("netdiag.IS_LINUX", False), patch("netdiag.IS_MACOS", False), patch("netdiag.IS_WINDOWS", True):
+            cmd = ping_command("1.1.1.1", ipv=4)
+            assert "-4" in cmd
+
+    def test_ipv6_windows(self):
+        with patch("netdiag.IS_LINUX", False), patch("netdiag.IS_MACOS", False), patch("netdiag.IS_WINDOWS", True):
             cmd = ping_command("1.1.1.1", ipv=6)
             assert "-6" in cmd
 

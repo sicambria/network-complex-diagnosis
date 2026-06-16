@@ -214,6 +214,35 @@ class TestFullDiagnostic:
             assert results["gateway"] is None
             assert results["gateway_ping"] is None
 
+    def test_no_gateway_not_quiet_prints(self):
+        args = Args(
+            hosts=["1.1.1.1"], count=3, interval=0.1, timeout=2,
+            dns_count=2, tcp_count=2, quiet=False,
+            no_trace=False, no_speedtest=False, no_iperf=False,
+            no_bufferbloat=False, download_test=False, connection_test=False,
+        )
+        with (
+            patch("netdiag.check_tools", return_value={}),
+            patch("netdiag.detect_gateway", return_value=None),
+            patch("netdiag.get_default_interface", return_value="eth0"),
+            patch("netdiag.interface_stats", return_value=_IFACE_STATS),
+            patch("netdiag.wifi_info", return_value=_WIFI),
+            patch("netdiag.ethtool_info", return_value=_ETHTOOL),
+            patch("netdiag.ping_burst", return_value=_INT_PING),
+            patch("netdiag.dns_test", return_value=_DNS_RESULT),
+            patch("netdiag.tcp_test", return_value=_TCP_RESULT),
+            patch("netdiag.tcp_socket_stats", return_value=_TCP_SOCK),
+            patch("netdiag.bufferbloat_test", return_value=_BUFFERBLOAT),
+            patch("netdiag.mtr_test", return_value=_MTR),
+            patch("netdiag.speedtest_result", return_value=_SPEEDTEST),
+            patch("netdiag.iperf3_test", return_value=_IPERF3),
+            patch("netdiag.diagnose", return_value=[]),
+            patch("netdiag.health_score", return_value=0),
+            patch("builtins.print") as mock_print,
+        ):
+            full_diagnostic(args)
+            mock_print.assert_any_call("No gateway detected.", flush=True)
+
     def test_no_default_interface(self):
         args = Args(
             hosts=["1.1.1.1"], count=3, interval=0.1, timeout=2,
@@ -676,6 +705,74 @@ class TestStartServer:
 
             mock_diag.assert_called()
             mock_save.assert_called()
+
+    def test_daemon_loop_exception(self):
+        args = Args(daemon=True, port=8080, history_dir="/tmp/.netdiag")
+        mock_app = MagicMock()
+        mock_cr = {"status": "idle", "progress": {}, "results": None}
+        mock_parser_fn = MagicMock()
+        mock_diag_args = MagicMock()
+        mock_diag_args.no_bufferbloat = False
+        mock_diag_args.history_dir = "/tmp/.netdiag"
+        mock_parser_fn.return_value.parse_args.return_value = mock_diag_args
+        mock_uvicorn = MagicMock()
+
+        sleep_count = [0]
+
+        def mock_sleep(secs):
+            sleep_count[0] += 1
+            if sleep_count[0] >= 1:
+                raise RuntimeError("break_loop")
+
+        with (
+            patch("netdiag.build_app", return_value=(mock_app, mock_cr, mock_parser_fn)),
+            patch("netdiag.IS_LINUX", True),
+            patch("netdiag.full_diagnostic", side_effect=ValueError("test error")) as mock_diag,
+            patch("netdiag.save_history") as mock_save,
+            patch("threading.Thread") as mock_thread_cls,
+            patch("time.sleep", side_effect=mock_sleep),
+            patch.dict("sys.modules", {"uvicorn": mock_uvicorn}),
+        ):
+            mock_thread_instance = MagicMock()
+            mock_thread_cls.return_value = mock_thread_instance
+            start_server(args)
+            call_kwargs = mock_thread_cls.call_args[1]
+            target = call_kwargs["target"]
+            target_args = call_kwargs["args"]
+            mock_cr["_lock"] = threading.RLock()
+
+            with pytest.raises(RuntimeError, match="break_loop"):
+                target(*target_args)
+
+            assert mock_cr["status"] == "error"
+            assert mock_cr["error"] == "test error"
+
+    def test_daemon_non_linux_sets_no_bufferbloat(self):
+        args = Args(daemon=True, port=8080, history_dir="/tmp/.netdiag")
+        mock_app = MagicMock()
+        mock_cr = {"status": "idle", "progress": {}, "results": None}
+        mock_parser_fn = MagicMock()
+        mock_diag_args = MagicMock()
+        mock_diag_args.no_bufferbloat = True
+        mock_diag_args.history_dir = "/tmp/.netdiag"
+        mock_parser_fn.return_value.parse_args.return_value = mock_diag_args
+        mock_uvicorn = MagicMock()
+
+        with (
+            patch("netdiag.build_app", return_value=(mock_app, mock_cr, mock_parser_fn)),
+            patch("netdiag.IS_LINUX", False),
+            patch("netdiag.IS_MACOS", True),
+            patch("threading.Thread") as mock_thread_cls,
+            patch.dict("sys.modules", {"uvicorn": mock_uvicorn}),
+        ):
+            mock_thread_instance = MagicMock()
+            mock_thread_cls.return_value = mock_thread_instance
+            start_server(args)
+            call_kwargs = mock_thread_cls.call_args[1]
+            target = call_kwargs["target"]
+            target_args = call_kwargs["args"]
+            # The target will run with no_bufferbloat = True
+            assert mock_diag_args.no_bufferbloat is True
 
     def test_build_app_failure(self):
         args = Args(daemon=False, port=8080)

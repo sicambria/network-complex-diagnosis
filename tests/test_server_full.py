@@ -71,6 +71,77 @@ class TestServerFull:
         assert "health_score" in data
         assert data["health_score"] == 50
 
+    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag._proc_net_wireless_any", return_value=None)
+    @patch("netdiag.has_tool", return_value=True)
+    @patch("netdiag.detect_wireless_interface", return_value="wlan0")
+    @patch("netdiag.wifi_info", return_value={"signal_dbm": -50, "available": True})
+    @patch("netdiag.detect_gateway", return_value="192.168.1.1")
+    @patch("netdiag.ping_once", return_value={"ok": True, "rtt_ms": 3.0})
+    @patch("netdiag.monitor_snapshot", return_value={"running": True})
+    @patch("netdiag.now_iso", return_value="2025-01-01T00:00:00")
+    def test_api_monitor_linux_wifi(self, *mocks):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/monitor")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["wifi"]["signal_dbm"] == -50
+        assert data["gateway_latency_ms"] == 3.0
+
+    @patch("netdiag.IS_LINUX", False)
+    @patch("netdiag.IS_MACOS", True)
+    @patch("netdiag.detect_wireless_interface", return_value="en0")
+    @patch("netdiag.wifi_info", return_value={"signal_dbm": -45, "available": True})
+    @patch("netdiag.detect_gateway", return_value="192.168.1.1")
+    @patch("netdiag.ping_once", return_value={"ok": True, "rtt_ms": 5.0})
+    @patch("netdiag.monitor_snapshot", return_value={"running": True})
+    @patch("netdiag.now_iso", return_value="2025-01-01T00:00:00")
+    def test_api_monitor_macos_wifi(self, *mocks):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/monitor")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["wifi"]["signal_dbm"] == -45
+
+    @patch("netdiag.IS_LINUX", False)
+    @patch("netdiag.IS_MACOS", False)
+    @patch("netdiag.IS_WINDOWS", True)
+    @patch("netdiag.detect_wireless_interface", return_value="Wi-Fi")
+    @patch("netdiag.wifi_info", return_value={"signal_dbm": -60, "available": True})
+    @patch("netdiag.detect_gateway", return_value="192.168.1.1")
+    @patch("netdiag.ping_once", return_value={"ok": True, "rtt_ms": 7.0})
+    @patch("netdiag.monitor_snapshot", return_value={"running": True})
+    @patch("netdiag.now_iso", return_value="2025-01-01T00:00:00")
+    def test_api_monitor_windows_wifi(self, *mocks):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/monitor")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["wifi"]["signal_dbm"] == -60
+
+    @patch("netdiag.IS_LINUX", False)
+    @patch("netdiag.IS_MACOS", False)
+    @patch("netdiag.IS_WINDOWS", True)
+    @patch("netdiag.detect_gateway", return_value="192.168.1.1")
+    @patch("netdiag.ping_once", return_value={"ok": False, "rtt_ms": None})
+    @patch("netdiag._tcp_ping", return_value={"ok": True, "rtt_ms": 15.0})
+    @patch("netdiag.monitor_snapshot", return_value={"running": True})
+    @patch("netdiag.now_iso", return_value="2025-01-01T00:00:00")
+    def test_api_monitor_tcp_fallback(self, *mocks):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/monitor")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["gateway_latency_ms"] == 15.0
+
     @patch("netdiag.IS_LINUX", False)
     @patch("netdiag.IS_MACOS", False)
     @patch("netdiag.IS_WINDOWS", False)
@@ -195,6 +266,28 @@ class TestServerFull:
         assert resp.status_code == 200
         mock_save.assert_called_once_with({})
 
+    def test_api_config_post_not_dict(self):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.post("/api/config", json=[1, 2, 3])
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "error" in data
+
+    def test_api_status_with_list_gateway(self):
+        from fastapi.testclient import TestClient
+        app, state, _ = self._make_app()
+        state["status"] = "done"
+        state["results"] = {"gateway_ping": [{"samples": [1, 2]}], "internet_ping": [{"samples": [3]}]}
+        client = TestClient(app)
+        resp = client.get("/api/status")
+        data = resp.json()
+        for item in data["results"]["gateway_ping"]:
+            assert "samples" not in item
+        for item in data["results"]["internet_ping"]:
+            assert "samples" not in item
+
     @patch("netdiag.full_diagnostic", return_value={"health_score": 90, "diagnosis": []})
     @patch("netdiag.save_history", return_value="session_123.json")
     def test_api_run(self, mock_save, mock_diag):
@@ -207,6 +300,16 @@ class TestServerFull:
         assert data["status"] == "ok"
         assert "session_id" in data
 
+    @patch("netdiag.IS_LINUX", False)
+    @patch("netdiag.full_diagnostic", return_value={"health_score": 90, "diagnosis": []})
+    @patch("netdiag.save_history", return_value="session_123.json")
+    def test_api_run_non_linux(self, mock_save, mock_diag, *mocks):
+        from fastapi.testclient import TestClient
+        app, state, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.post("/api/run", json={})
+        assert resp.status_code == 200
+
     def test_api_run_already_running(self):
         from fastapi.testclient import TestClient
         app, state, _ = self._make_app()
@@ -216,6 +319,18 @@ class TestServerFull:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "error"
+
+    @patch("netdiag.full_diagnostic", return_value={"health_score": 90, "diagnosis": []})
+    @patch("netdiag.save_history", return_value="session_123.json")
+    def test_api_run_bad_body(self, mock_save, mock_diag):
+        from fastapi.testclient import TestClient
+        app, state, _ = self._make_app()
+        state["status"] = "idle"
+        client = TestClient(app)
+        resp = client.post("/api/run", content=b"not-json", headers={"Content-Type": "application/json"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
 
     @patch("netdiag.Path.is_dir")
     @patch("netdiag.Path.iterdir")
@@ -265,6 +380,28 @@ class TestServerFull:
         resp = client.get("/api/report/nonexistent.txt")
         assert resp.status_code == 404
 
+    @patch("netdiag.Path.exists", return_value=True)
+    @patch("netdiag.Path.is_file", return_value=True)
+    @patch("netdiag.Path.read_bytes", return_value=b'{"a":1}')
+    def test_api_report_json(self, mock_read, mock_is_file, mock_exists):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/report/data.json")
+        assert resp.status_code == 200
+        assert "application/json" in resp.headers["content-type"]
+
+    @patch("netdiag.Path.exists", return_value=True)
+    @patch("netdiag.Path.is_file", return_value=True)
+    @patch("netdiag.Path.read_bytes", return_value=b"a,b,c\n1,2,3")
+    def test_api_report_csv(self, mock_read, mock_is_file, mock_exists):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/report/data.csv")
+        assert resp.status_code == 200
+        assert "text/csv" in resp.headers["content-type"]
+
     @patch("netdiag.load_history", return_value=[{"_file": "session_123.json", "health_score": 80}])
     def test_api_history(self, mock_load):
         from fastapi.testclient import TestClient
@@ -285,6 +422,15 @@ class TestServerFull:
         resp = client.get("/api/history")
         data = resp.json()
         assert "raw" not in data["sessions"][0]
+
+    @patch("netdiag.load_history", return_value=[{"_file": "s.json", "gateway_ping": {"samples": [1]}}])
+    def test_api_history_strips_dict_samples(self, mock_load):
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.get("/api/history")
+        data = resp.json()
+        assert "samples" not in data["sessions"][0]["gateway_ping"]
 
     def _mock_hdir(self, mock_ensure, exists=True, read_text_val="{}"):
         d = MagicMock()
