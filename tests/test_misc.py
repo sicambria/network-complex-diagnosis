@@ -1,7 +1,7 @@
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from netdiag import (
     has_tool, check_tools, install_hint,
