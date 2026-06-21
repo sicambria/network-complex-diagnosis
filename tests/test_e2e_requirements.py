@@ -1195,6 +1195,75 @@ class TestReq028Tools:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# REQ-029 — Intermittent Connection Reliability Detection (--reliability-test)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestReq029Reliability:
+    @pytest.mark.REQ029
+    def test_req_029_tool_registered(self):
+        ids = [t["id"] for t in netdiag.TOOLS_MENU]
+        assert "reliability_test" in ids, "reliability_test tool not registered"
+        tool = next(t for t in netdiag.TOOLS_MENU if t["id"] == "reliability_test")
+        keys = {p["key"] for p in tool["params"]}
+        for k in ("targets", "samples", "duration", "concurrency", "retries", "timeout"):
+            assert k in keys, f"reliability tool missing configurable param '{k}'"
+
+    @pytest.mark.REQ029
+    def test_req_029_config_keys(self):
+        cfg = netdiag.load_config()
+        for k in ("reliability_targets", "reliability_samples",
+                  "reliability_concurrency", "reliability_duration"):
+            assert k in cfg, f"config missing '{k}'"
+
+    @pytest.mark.REQ029
+    def test_req_029_phase_failure_attribution(self):
+        # A failure injected at the TCP phase must be attributed to that phase.
+        from unittest import mock
+        with mock.patch.object(netdiag.socket, "getaddrinfo",
+                               return_value=[(netdiag.socket.AF_INET,
+                                              netdiag.socket.SOCK_STREAM, 0, "",
+                                              ("203.0.113.1", 443))]), \
+             mock.patch.object(netdiag.socket, "socket") as msock:
+            inst = msock.return_value
+            inst.connect.side_effect = OSError("connection refused")
+            r = netdiag.reliability_test(targets=["https://example.invalid/"],
+                                         samples=2, concurrency=1,
+                                         compare_concurrency=False, ipv=4, retries=0)
+        assert r["available"] is True
+        assert r["fail_phase_breakdown"]["tcp"] > 0, "TCP failure not attributed to tcp phase"
+        assert r["first_attempt_fail_pct"] == 100.0
+
+    @pytest.mark.REQ029
+    def test_req_029_retry_masked_and_phase_verdicts(self):
+        # High recovered-on-retry with phase clustering -> retry-masked + TLS verdicts.
+        crafted = {
+            "samples_total": 10, "first_attempt_fail_pct": 30.0,
+            "recovered_on_retry": 29, "hard_failures": 1,
+            "fail_phase_breakdown": {"dns": 0, "tcp": 0, "tls": 10, "ttfb": 0, "body": 0, "unknown": 0},
+            "by_family": {"ipv4": {"samples": 10, "first_fail_pct": 30.0, "hard_fail_pct": 10.0}},
+            "by_concurrency": {"high": {"first_fail_pct": 30.0}},
+            "by_target": [],
+        }
+        titles = [v["title"] for v in netdiag.reliability_verdict(crafted)]
+        assert any("TLS" in t for t in titles), "TLS clustering verdict missing"
+        assert any("recover on retry" in t for t in titles), "retry-masked verdict missing"
+
+    @pytest.mark.REQ029
+    def test_req_029_ipv6_verdict(self):
+        crafted = {
+            "samples_total": 100, "first_attempt_fail_pct": 20.0,
+            "recovered_on_retry": 0, "hard_failures": 20,
+            "fail_phase_breakdown": {"dns": 0, "tcp": 20, "tls": 0, "ttfb": 0, "body": 0, "unknown": 0},
+            "by_family": {"ipv4": {"samples": 50, "first_fail_pct": 2.0, "hard_fail_pct": 2.0},
+                          "ipv6": {"samples": 50, "first_fail_pct": 40.0, "hard_fail_pct": 40.0}},
+            "by_concurrency": {"high": {"first_fail_pct": 20.0}},
+            "by_target": [],
+        }
+        titles = [v["title"] for v in netdiag.reliability_verdict(crafted)]
+        assert any("IPv6" in t for t in titles), "IPv6-broken verdict missing"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # NFR-001 — Zero Dependencies (CLI)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1218,7 +1287,7 @@ class TestNFR001ZeroDeps:
         STDLIB = {"argparse", "collections", "csv", "json", "logging", "os", "platform",
                   "re", "shutil", "socket", "statistics", "subprocess",
                   "sys", "time", "datetime", "pathlib", "ast", "math",
-                  "tempfile", "io", "concurrent", "urllib", "copy"}
+                  "tempfile", "io", "concurrent", "urllib", "copy", "ssl", "itertools", "html"}
         # Also allowed: netdiag itself (for test imports)
         ALSO_OK = {"netdiag", "fastapi", "uvicorn", "asyncio", "threading"}
         third_party = imports - STDLIB - ALSO_OK
@@ -1401,7 +1470,7 @@ class TestReqE2ESelfCheck:
     @pytest.mark.REQ_E2E
     def test_e2e_requirements_coverage_complete(self):
         """Verify every REQ and NFR has a corresponding test method."""
-        req_ids = [f"REQ{i:03d}" for i in range(1, 29)]
+        req_ids = [f"REQ{i:03d}" for i in range(1, 30)]
         nfr_ids = [f"NFR{i:03d}" for i in range(1, 8)]
         all_ids = set(req_ids + nfr_ids)
 

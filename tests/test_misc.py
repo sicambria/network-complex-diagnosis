@@ -474,7 +474,7 @@ class TestZeroDeps:
             "datetime", "pathlib", "logging", "ast", "textwrap",
             "collections", "math", "io", "itertools", "functools",
             "typing", "urllib", "http", "ssl", "threading", "concurrent",
-            "tempfile", "signal",
+            "tempfile", "signal", "html",
         }
         # optional GUI deps allowed inside function bodies
         optional_allow = {"fastapi", "uvicorn", "asyncio", "httpx", "anyio"}

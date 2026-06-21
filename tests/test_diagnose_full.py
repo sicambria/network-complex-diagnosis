@@ -97,11 +97,23 @@ class TestDiagnoseMissing:
         assert any(d["layer"] == "internet" and d["severity"] == "bad" for d in diag)
 
     def test_download_warning(self):
+        # A warning now comes from image-fetch FAILURES (a reliability signal), not
+        # from a low aggregate Mbps on tiny concurrent images (not a bandwidth test).
         results = _make_results({
-            "download_test": {"avg_mbps": 2.0, "success": 2, "failures": 0, "error": None},
+            "download_test": {"avg_mbps": 2.0, "success": 9, "failures": 1, "error": None},
         })
         diag = diagnose(results)
         assert any(d["layer"] == "internet" and d["severity"] == "warning" for d in diag)
+
+    def test_download_low_mbps_zero_failures_is_clean(self):
+        # 0.47 Mbps over 100 tiny images with 0 failures is expected, not a fault —
+        # this is the reported 'red X + No specific fix needed' contradiction, fixed.
+        results = _make_results({
+            "download_test": {"avg_mbps": 0.47, "success": 100, "failures": 0, "error": None},
+        })
+        diag = diagnose(results)
+        dl = [d for d in diag if d["layer"] == "internet" and "image" in d["title"].lower()]
+        assert dl and dl[0]["severity"] == "clean"
 
     def test_download_clean(self):
         results = _make_results({

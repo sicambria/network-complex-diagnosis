@@ -50,7 +50,54 @@ log = logging.getLogger("netdiag")
 DEFAULT_HOSTS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "google.com"]
 DNS_HOSTS = ["google.com", "cloudflare.com", "quad9.net"]
 TCP_TARGETS = [("1.1.1.1", 443), ("8.8.8.8", 443), ("google.com", 443)]
+# Public anycast resolvers that deliberately deprioritize / rate-limit ICMP echo.
+# A high ICMP "loss" figure to these while TCP/HTTPS to the same address succeeds
+# is the resolver shedding ping load, NOT packets being dropped on the line. We
+# never report packet loss the working TCP layer contradicts (see reconcile_icmp).
+ICMP_RATE_LIMITERS = {
+    "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
+    "9.9.9.9", "149.112.112.112", "208.67.222.222", "208.67.220.220",
+}
 IPERF_SERVER = "iperf3.moji.fr"
+# Reliability probe targets: a deliberate mix of hostname HTTPS endpoints (small
+# bodies/images) and bare-IP endpoints. Bare-IP targets skip DNS entirely, which
+# lets the probe isolate resolver intermittency from connection intermittency.
+RELIABILITY_TARGETS = [
+    "https://www.google.com/generate_204",
+    "https://cloudflare.com/cdn-cgi/trace",
+    "https://www.wikipedia.org/static/images/project-logos/enwiki.png",
+    "https://1.1.1.1/",
+    "https://8.8.8.8/",
+]
+
+# 100 well-known, safe, globally-reachable HTTPS sites. The intermittent-connection
+# reproducer fetches each site's favicon (a tiny static asset present on all of them)
+# many times with cache-busting, recreating the "page with lots of small images"
+# load pattern that triggers intermittent first-attempt failures. We only measure the
+# CONNECTION (DNS/TCP/TLS/first byte), so a redirect or 404 still exercises the full
+# path and counts as a reachable connection.
+WELLKNOWN_SITES = [
+    "google.com", "youtube.com", "facebook.com", "wikipedia.org", "amazon.com",
+    "reddit.com", "microsoft.com", "apple.com", "netflix.com", "instagram.com",
+    "linkedin.com", "github.com", "stackoverflow.com", "cloudflare.com", "mozilla.org",
+    "wordpress.org", "bbc.com", "cnn.com", "nytimes.com", "theguardian.com",
+    "yahoo.com", "bing.com", "duckduckgo.com", "ebay.com", "twitch.tv",
+    "spotify.com", "paypal.com", "dropbox.com", "adobe.com", "salesforce.com",
+    "oracle.com", "ibm.com", "intel.com", "nvidia.com", "amd.com",
+    "samsung.com", "sony.com", "dell.com", "hp.com", "cisco.com",
+    "vmware.com", "redhat.com", "ubuntu.com", "debian.org", "python.org",
+    "nodejs.org", "npmjs.com", "docker.com", "kubernetes.io", "gitlab.com",
+    "bitbucket.org", "atlassian.com", "slack.com", "zoom.us", "notion.so",
+    "figma.com", "canva.com", "medium.com", "quora.com", "pinterest.com",
+    "tumblr.com", "vimeo.com", "soundcloud.com", "imdb.com", "booking.com",
+    "airbnb.com", "uber.com", "etsy.com", "shopify.com", "squarespace.com",
+    "godaddy.com", "namecheap.com", "digitalocean.com", "fastly.com", "akamai.com",
+    "mit.edu", "stanford.edu", "harvard.edu", "nasa.gov", "who.int",
+    "un.org", "europa.eu", "archive.org", "ietf.org", "w3.org",
+    "gnu.org", "kernel.org", "apache.org", "nginx.org", "postgresql.org",
+    "mysql.com", "mongodb.com", "redis.io", "elastic.co", "hashicorp.com",
+    "wordpress.com", "wikimedia.org", "creativecommons.org", "letsencrypt.org", "openstreetmap.org",
+]
 
 APT_PACKAGES = {
     "ping": "iputils-ping",
@@ -1134,6 +1181,493 @@ def http_latency_test(hosts=None, count=5, timeout_s=5):
     return results
 
 
+def _reliability_host_info(url):
+    import urllib.parse
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    is_ip = False
+    ip_family = None
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        is_ip, ip_family = True, socket.AF_INET
+    except OSError:
+        try:
+            socket.inet_pton(socket.AF_INET6, host)
+            is_ip, ip_family = True, socket.AF_INET6
+        except OSError:
+            pass
+    return host, is_ip, ip_family
+
+
+def reliability_test(targets=None, samples=20, duration_s=0, concurrency=8,
+                     retries=2, timeout_s=5, ipv=0, compare_concurrency=True,
+                     callback=None, label="reliability"):
+    import ssl, urllib.parse, urllib.request, concurrent.futures, itertools, os
+    if targets is None:
+        targets = list(RELIABILITY_TARGETS)
+    if isinstance(targets, str):
+        targets = [t.strip() for t in targets.split(",") if t.strip()]
+    targets = [t for t in targets if t]
+    samples = max(1, int(samples))
+    concurrency = max(1, int(concurrency))
+    retries = max(0, int(retries))
+    timeout_s = max(1, int(timeout_s))
+    duration_s = max(0, int(duration_s))
+    try:
+        ipv = int(ipv)
+    except (TypeError, ValueError):
+        ipv = 0
+    if ipv not in (0, 4, 6):
+        ipv = 0
+    if not targets:
+        return {"available": False, "error": "no targets", "verdict": []}
+
+    config = {"targets": targets, "samples": samples, "duration_s": duration_s,
+              "concurrency": concurrency, "retries": retries, "timeout_s": timeout_s,
+              "ipv": ipv, "compare_concurrency": bool(compare_concurrency)}
+
+    seq = itertools.count()
+    # Per-call nonce so cache-busting tokens never repeat across runs in the same
+    # process (belt-and-suspenders on top of the no-cache headers / Connection: close).
+    nonce = "%d-%s" % (os.getpid(), os.urandom(4).hex())
+
+    fam_all = [("ipv4", socket.AF_INET), ("ipv6", socket.AF_INET6)]
+    if ipv == 4:
+        fam_sel = [fam_all[0]]
+    elif ipv == 6:
+        fam_sel = [fam_all[1]]
+    else:
+        fam_sel = fam_all
+
+    meta = {}
+    jobs_base = []
+    for url in targets:
+        host, is_ip, ip_family = _reliability_host_info(url)
+        meta[url] = {"host": host, "is_ip": is_ip}
+        if is_ip:
+            fams = [f for f in fam_sel if f[1] == ip_family]
+        else:
+            fams = fam_sel
+        for f in fams:
+            jobs_base.append((url, f))
+
+    if not jobs_base:
+        return {"available": False, "error": "no usable target/family pairs",
+                "config": config, "verdict": []}
+
+    def _attempt_manual(url, fam):
+        out = {"ok": False, "fail_phase": None, "error": None, "family": fam[0],
+               "dns_ms": None, "tcp_ms": None, "tls_ms": None, "ttfb_ms": None,
+               "body_ms": None, "bytes": 0, "ip": None}
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+        is_https = parsed.scheme != "http"
+        port = parsed.port or (443 if is_https else 80)
+        base_path = parsed.path or "/"
+        cb = "nocache=%s-%d" % (nonce, next(seq))
+        if parsed.query:
+            path = base_path + "?" + parsed.query + "&" + cb
+        else:
+            path = base_path + "?" + cb
+        af = fam[1]
+        sock = None
+        try:
+            t0 = time.perf_counter()
+            try:
+                infos = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM)
+            except Exception as e:
+                out["fail_phase"] = "dns"; out["error"] = str(e); return out
+            out["dns_ms"] = clean_float((time.perf_counter() - t0) * 1000)
+            if not infos:
+                out["fail_phase"] = "dns"; out["error"] = "no addresses"; return out
+            family_, socktype, proto, _, sockaddr = infos[next(seq) % len(infos)]
+            out["ip"] = sockaddr[0]
+            t1 = time.perf_counter()
+            try:
+                sock = socket.socket(family_, socktype, proto)
+                sock.settimeout(timeout_s)
+                sock.connect(sockaddr)
+            except Exception as e:
+                out["fail_phase"] = "tcp"; out["error"] = str(e); return out
+            out["tcp_ms"] = clean_float((time.perf_counter() - t1) * 1000)
+            if is_https:
+                t2 = time.perf_counter()
+                try:
+                    ctx = ssl.create_default_context()
+                    try:
+                        ctx.options |= ssl.OP_NO_TICKET
+                    except Exception:
+                        pass
+                    sock = ctx.wrap_socket(sock, server_hostname=host)
+                except Exception as e:
+                    out["fail_phase"] = "tls"; out["error"] = str(e); return out
+                out["tls_ms"] = clean_float((time.perf_counter() - t2) * 1000)
+            req = (
+                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: NetDiag/1.0\r\n"
+                "Accept: */*\r\nCache-Control: no-cache, no-store, max-age=0\r\n"
+                "Pragma: no-cache\r\nConnection: close\r\n\r\n" % (path, host)
+            ).encode("ascii", "ignore")
+            t3 = time.perf_counter()
+            try:
+                sock.sendall(req)
+                first = sock.recv(4096)
+            except Exception as e:
+                out["fail_phase"] = "ttfb"; out["error"] = str(e); return out
+            out["ttfb_ms"] = clean_float((time.perf_counter() - t3) * 1000)
+            if not first:
+                out["fail_phase"] = "ttfb"; out["error"] = "empty response"; return out
+            total = len(first)
+            t4 = time.perf_counter()
+            try:
+                while True:
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+            except Exception as e:
+                out["fail_phase"] = "body"; out["error"] = str(e); return out
+            out["body_ms"] = clean_float((time.perf_counter() - t4) * 1000)
+            out["bytes"] = total
+            out["ok"] = True
+            return out
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _attempt_urllib(url, fam, prior_err):
+        # Plan B: the manual socket/ssl stack hit an unexpected error. Fall back to
+        # a cache-busting urllib request for total-time only (no phase breakdown).
+        out = {"ok": False, "fail_phase": "unknown", "error": str(prior_err),
+               "family": fam[0], "dns_ms": None, "tcp_ms": None, "tls_ms": None,
+               "ttfb_ms": None, "body_ms": None, "bytes": 0, "ip": None}
+        parsed = urllib.parse.urlsplit(url)
+        sep = "&" if parsed.query else "?"
+        full = url + sep + "nocache=%s-%d" % (nonce, next(seq))
+        try:
+            t0 = time.perf_counter()
+            req = urllib.request.Request(full, headers={
+                "User-Agent": "NetDiag/1.0", "Connection": "close",
+                "Cache-Control": "no-cache, no-store, max-age=0", "Pragma": "no-cache"})
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                data = resp.read()
+            out["ttfb_ms"] = clean_float((time.perf_counter() - t0) * 1000)
+            out["bytes"] = len(data)
+            out["ok"] = True
+            out["fail_phase"] = None
+        except Exception as e:
+            out["error"] = str(e)
+        return out
+
+    def _attempt(url, fam):
+        try:
+            return _attempt_manual(url, fam)
+        except Exception as e:
+            return _attempt_urllib(url, fam, e)
+
+    def _trial(url, fam):
+        info = meta[url]
+        a = _attempt(url, fam)
+        attempts = 1
+        good = a
+        while not good["ok"] and attempts <= retries:
+            attempts += 1
+            good = _attempt(url, fam)
+        ok_src = good if good["ok"] else a
+        return {
+            "url": url, "host": info["host"], "is_ip": info["is_ip"], "family": fam[0],
+            "first_ok": a["ok"],
+            "first_fail_phase": None if a["ok"] else (a["fail_phase"] or "unknown"),
+            "eventual_ok": good["ok"], "attempts": attempts,
+            "dns_ms": ok_src["dns_ms"] if good["ok"] else None,
+            "tcp_ms": ok_src["tcp_ms"] if good["ok"] else None,
+            "tls_ms": ok_src["tls_ms"] if good["ok"] else None,
+            "ttfb_ms": ok_src["ttfb_ms"] if good["ok"] else None,
+        }
+
+    def _run_pass(conc, rounds, use_duration, label):
+        out = []
+        r = 0
+        deadline = (time.perf_counter() + duration_s) if use_duration else None
+        planned = rounds * len(jobs_base)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as pool:
+            while True:
+                if use_duration:
+                    if time.perf_counter() >= deadline:
+                        break
+                elif r >= rounds:
+                    break
+                futs = [pool.submit(_trial, u, f) for (u, f) in jobs_base]
+                for fut in concurrent.futures.as_completed(futs):
+                    out.append(fut.result())
+                r += 1
+                if callback:
+                    ok = sum(1 for t in out if t["eventual_ok"])
+                    total = planned if not use_duration else max(len(out), 1)
+                    callback(label, len(out), total, ok, None, "running")
+        return out
+
+    use_duration = duration_s > 0
+    high = _run_pass(concurrency, samples, use_duration, label)
+    low = []
+    if compare_concurrency and concurrency > 1 and high:
+        low_rounds = min(samples, 5)
+        low = _run_pass(1, low_rounds, False, label + "_low")
+
+    def _phase_breakdown(items):
+        pb = {"dns": 0, "tcp": 0, "tls": 0, "ttfb": 0, "body": 0, "unknown": 0}
+        for t in items:
+            if not t["first_ok"]:
+                p = t["first_fail_phase"] or "unknown"
+                pb[p] = pb.get(p, 0) + 1
+        return pb
+
+    def _group(items):
+        n = len(items)
+        ff = sum(1 for t in items if not t["first_ok"])
+        hf = sum(1 for t in items if not t["eventual_ok"])
+        return {
+            "samples": n,
+            "first_fail_pct": clean_float(100 * ff / n) if n else None,
+            "hard_fail_pct": clean_float(100 * hf / n) if n else None,
+            "fail_phase_breakdown": _phase_breakdown(items),
+        }
+
+    def _phase_p95(items, key):
+        vals = [t[key] for t in items if t["eventual_ok"] and t.get(key) is not None]
+        return percentile(vals, 95) and clean_float(percentile(vals, 95))
+
+    total = len(high)
+    first_fails = [t for t in high if not t["first_ok"]]
+    recovered = sum(1 for t in high if (not t["first_ok"]) and t["eventual_ok"])
+    hard = sum(1 for t in high if not t["eventual_ok"])
+
+    by_family = {}
+    for fam in fam_sel:
+        items = [t for t in high if t["family"] == fam[0]]
+        if items:
+            by_family[fam[0]] = _group(items)
+
+    by_target = []
+    for url in targets:
+        items = [t for t in high if t["url"] == url]
+        if not items:
+            continue
+        g = _group(items)
+        g.update({"url": url, "host": meta[url]["host"], "is_ip": meta[url]["is_ip"],
+                  "dns_p95": _phase_p95(items, "dns_ms"), "tcp_p95": _phase_p95(items, "tcp_ms"),
+                  "tls_p95": _phase_p95(items, "tls_ms"), "ttfb_p95": _phase_p95(items, "ttfb_ms")})
+        by_target.append(g)
+
+    by_concurrency = {"high": {"first_fail_pct": clean_float(100 * len(first_fails) / total) if total else None,
+                               "samples": total}}
+    if low:
+        lff = sum(1 for t in low if not t["first_ok"])
+        by_concurrency["low"] = {"first_fail_pct": clean_float(100 * lff / len(low)),
+                                 "samples": len(low)}
+
+    result = {
+        "available": True, "error": None, "config": config,
+        "samples_total": total,
+        "first_attempt_fail_pct": clean_float(100 * len(first_fails) / total) if total else None,
+        "recovered_on_retry": recovered,
+        "hard_failures": hard,
+        "fail_phase_breakdown": _phase_breakdown(high),
+        "by_family": by_family,
+        "by_concurrency": by_concurrency,
+        "by_target": by_target,
+        "latency": {"dns_p95": _phase_p95(high, "dns_ms"), "tcp_p95": _phase_p95(high, "tcp_ms"),
+                    "tls_p95": _phase_p95(high, "tls_ms"), "ttfb_p95": _phase_p95(high, "ttfb_ms")},
+    }
+    result["verdict"] = reliability_verdict(result)
+    return result
+
+
+def reliability_verdict(result):
+    verdict = []
+    total = result.get("samples_total", 0)
+    if not total:
+        return [{"layer": "reliability", "severity": "info",
+                 "title": "No reliability samples collected",
+                 "detail": "The probe produced no usable samples.", "fix": ""}]
+    ff_pct = result.get("first_attempt_fail_pct") or 0
+    recovered = result.get("recovered_on_retry", 0)
+    hard = result.get("hard_failures", 0)
+    pb = result.get("fail_phase_breakdown", {})
+    fam = result.get("by_family", {})
+    conc = result.get("by_concurrency", {})
+    targets = result.get("by_target", [])
+
+    # IPv6 broken while IPv4 fine — the classic "first fails then retry works".
+    v4 = fam.get("ipv4"); v6 = fam.get("ipv6")
+    if v4 and v6 and v6.get("samples") and v4.get("samples"):
+        v6f = v6.get("first_fail_pct") or 0
+        v4f = v4.get("first_fail_pct") or 0
+        if v6f >= 30 and v4f <= 10:
+            verdict.append({"layer": "reliability", "severity": "bad",
+                "title": "IPv6 connections failing, IPv4 fine",
+                "detail": "IPv6 first-attempt failures %.0f%% vs IPv4 %.0f%%. Apps try IPv6 first "
+                          "and fall back to IPv4 — this is the 'first connection fails, retry works' "
+                          "symptom." % (v6f, v4f),
+                "fix": "Repair IPv6 (router RA/DHCPv6) or disable/deprioritize IPv6 on this host."})
+
+    # Concurrency-triggered failures — the "many small files/images" symptom.
+    hi = conc.get("high", {}); lo = conc.get("low", {})
+    if lo and hi and lo.get("first_fail_pct") is not None and hi.get("first_fail_pct") is not None:
+        hif = hi["first_fail_pct"]; lof = lo["first_fail_pct"]
+        if lof <= 10 and hif >= 25 and (hif - lof) >= 15:
+            verdict.append({"layer": "reliability", "severity": "bad",
+                "title": "Failures only under many parallel connections",
+                "detail": "First-attempt failures jump from %.0f%% (sequential) to %.0f%% under "
+                          "concurrency — pages with many images/small files trigger this." % (lof, hif),
+                "fix": "Likely router NAT/conntrack-table exhaustion or rate-limiting. Raise conntrack "
+                       "limits, reboot/replace the router, or reduce parallel connections."})
+
+    # DNS intermittency — hostname targets fail but bare-IP targets are clean.
+    host_t = [t for t in targets if not t.get("is_ip")]
+    ip_t = [t for t in targets if t.get("is_ip")]
+    if host_t and ip_t:
+        host_ff = max((t.get("first_fail_pct") or 0) for t in host_t)
+        ip_ff = max((t.get("first_fail_pct") or 0) for t in ip_t)
+        if host_ff >= 25 and ip_ff <= 10:
+            verdict.append({"layer": "reliability", "severity": "warning",
+                "title": "Name resolution is the unreliable step",
+                "detail": "Hostname targets fail %.0f%% on first try but bare-IP targets only %.0f%% — "
+                          "DNS is intermittent." % (host_ff, ip_ff),
+                "fix": "Switch resolver to 1.1.1.1 or 8.8.8.8, or check the router's DNS / DoH settings."})
+
+    # Phase clustering among first-attempt failures.
+    fail_phases = {k: v for k, v in pb.items() if k != "unknown" and v}
+    if fail_phases:
+        top = max(fail_phases, key=fail_phases.get)
+        share = fail_phases[top] / max(sum(pb.values()), 1)
+        if share >= 0.5 and ff_pct >= 10:
+            msg = {
+                "tls": ("TLS handshakes intermittently failing",
+                        "Most first-attempt failures are in the TLS handshake.",
+                        "Check path MTU/MSS clamping (see the MTU probe), VPN/PPPoE overhead, or a middlebox."),
+                "tcp": ("TCP connects intermittently dropping",
+                        "Most first-attempt failures are at TCP connect (SYN).",
+                        "Suggests SYN loss, router state-table limits, or upstream congestion."),
+                "ttfb": ("Server responses intermittently stalling",
+                         "Most first-attempt failures occur waiting for the first byte.",
+                         "Check for upstream/CDN issues or a saturated link."),
+                "body": ("Transfers intermittently cut off mid-body",
+                         "Connections open but the body read fails.",
+                         "Suggests a flaky link dropping established connections."),
+                "dns": ("DNS resolution intermittently failing",
+                        "Most first-attempt failures are in DNS resolution.",
+                        "Switch resolver to 1.1.1.1/8.8.8.8 or check router DNS."),
+            }.get(top)
+            if msg and not (top == "dns" and any(v["title"].startswith("Name resolution") for v in verdict)):
+                verdict.append({"layer": "reliability", "severity": "warning",
+                    "title": msg[0], "detail": msg[1] + " (%.0f%% of first attempts failed.)" % ff_pct,
+                    "fix": msg[2]})
+
+    # Retry-masked unreliability.
+    if total and recovered / total >= 0.15 and hard <= max(1, total * 0.05):
+        verdict.append({"layer": "reliability", "severity": "warning",
+            "title": "Connections unreliable on first try but recover on retry",
+            "detail": "%d of %d trials failed first but succeeded on retry. Users feel this as slow, "
+                      "flaky loading even though little 'fails' outright." % (recovered, total),
+            "fix": "Combine with the IPv6 / concurrency / DNS findings above to localize the cause."})
+
+    if not verdict:
+        if ff_pct >= 10:
+            verdict.append({"layer": "reliability", "severity": "warning",
+                "title": "Intermittent first-attempt failures",
+                "detail": "%.0f%% of first attempts failed without a single dominant cause." % ff_pct,
+                "fix": "Re-run with more samples and higher concurrency to localize the pattern."})
+        else:
+            verdict.append({"layer": "reliability", "severity": "clean",
+                "title": "Connections reliable",
+                "detail": "First-attempt failure rate %.0f%% across %d samples." % (ff_pct, total),
+                "fix": ""})
+    return verdict
+
+
+def wellknown_sites_test(sites=None, duration_s=150, concurrency=12, timeout_s=5,
+                         retries=2, callback=None):
+    # Intermittent-connection reproducer: hammer ~100 well-known sites' favicons
+    # under concurrency for ~2.5 minutes, recreating the "page with many small
+    # images" load pattern. Built entirely on reliability_test so all the per-phase
+    # timing, first-vs-retry and per-target accounting come for free. We force IPv4
+    # because across 100 mixed sites IPv6 availability varies wildly and would
+    # otherwise drown the result in false "IPv6 broken" noise; the concurrency A/B
+    # pass is skipped (a 100-target sequential pass would take far too long).
+    if sites is None:
+        sites = WELLKNOWN_SITES
+    targets = ["https://%s/favicon.ico" % s for s in sites]
+    result = reliability_test(
+        targets=targets, samples=10, duration_s=duration_s, concurrency=concurrency,
+        retries=retries, timeout_s=timeout_s, ipv=4, compare_concurrency=False,
+        callback=callback, label="wellknown")
+    if result.get("available"):
+        result["site_count"] = len(sites)
+        result["verdict"] = wellknown_verdict(result)
+    return result
+
+
+def wellknown_verdict(result):
+    # A site-fleet-specific headline on top of the generic reliability findings:
+    # name the worst-offending sites and frame the result as page-load reliability.
+    verdict = []
+    total = result.get("samples_total", 0)
+    if not total:
+        return [{"layer": "reliability", "severity": "info",
+                 "title": "Site-fleet probe collected no samples",
+                 "detail": "No connections completed.", "fix": ""}]
+    ff = result.get("first_attempt_fail_pct") or 0
+    hard = result.get("hard_failures", 0)
+    recovered = result.get("recovered_on_retry", 0)
+    by_target = result.get("by_target", []) or []
+    n_sites = result.get("site_count", len(by_target))
+    worst = sorted(by_target, key=lambda t: -(t.get("first_fail_pct") or 0))
+    worst = [t for t in worst if (t.get("first_fail_pct") or 0) > 0][:8]
+    worst_facts = ["%s: %.0f%% first-attempt fail (%d samples)"
+                   % (t.get("host"), t.get("first_fail_pct") or 0, t.get("samples", 0)) for t in worst]
+    facts = ["Probed %d well-known sites, %d total connection attempts." % (n_sites, total),
+             "First-attempt failures: %.1f%%. Hard failures (failed even after retries): %d. "
+             "Recovered on retry: %d." % (ff, hard, recovered)]
+    facts += worst_facts
+    if ff >= 10 or hard > max(2, total * 0.02):
+        sev = "bad" if (ff >= 25 or hard > max(5, total * 0.05)) else "warning"
+        verdict.append({
+            "layer": "reliability", "severity": sev,
+            "title": "Intermittent connection failures reproduced across many sites",
+            "detail": "%.1f%% of first connection attempts to well-known sites failed under load."
+                      % ff,
+            "facts": facts,
+            "assumption": "Failures spread across many independent, healthy sites (not one) point to "
+                          "something on the path common to all of them — typically the router under "
+                          "concurrency (NAT/conntrack-table exhaustion or rate-limiting), Wi-Fi, or an "
+                          "upstream link — rather than any individual website.",
+            "confidence": "high" if total > 200 else "medium",
+            "fix": "If failures recover on retry, raise the router's conntrack/NAT limits or replace "
+                   "the router; test on Ethernet to rule out Wi-Fi. Attach the ISP report if the "
+                   "pattern points upstream."})
+    else:
+        verdict.append({
+            "layer": "reliability", "severity": "clean",
+            "title": "Page-load reliability looks good across many sites",
+            "detail": "%.1f%% first-attempt failures across %d sites — within normal range." % (ff, n_sites),
+            "facts": facts,
+            "assumption": "A low first-attempt failure rate across a large, diverse fleet of sites means "
+                          "the connection holds up under the 'many small requests' pattern that web "
+                          "pages generate.",
+            "confidence": "high" if total > 200 else "medium",
+            "fix": ""})
+    # Fold in the generic reliability findings (phase clustering, retry-masking, etc.)
+    for v in reliability_verdict(result):
+        if v.get("severity") != "clean":
+            v = dict(v)
+            v.setdefault("confidence", "medium")
+            verdict.append(v)
+    return verdict
+
+
 def mtu_probe(host="1.1.1.1", max_size=1500):
     import shutil
     if not has_tool("ping"):
@@ -1155,6 +1689,81 @@ def mtu_probe(host="1.1.1.1", max_size=1500):
         else:
             high = mid - 1
     return {"available": True, "mtu": last_ok + 28, "payload_size": last_ok}
+
+
+def reconcile_icmp(results):
+    # Cross-reference ICMP ping loss against TCP-connect / HTTP / DNS success to the
+    # SAME hosts. A genuine high packet-loss rate cannot coexist with a near-100%
+    # TCP handshake success rate (a TCP handshake needs several successful round
+    # trips). So when ICMP loss is high but TCP/HTTPS to the same host succeeds, the
+    # missing echo replies are being rate-limited/deprioritized by the destination,
+    # not dropped on the user's line. This keeps the diagnosis engine from ever
+    # reporting "packet loss" that the working transport layer disproves.
+    internet = results.get("internet_ping") or []
+    tcp_rows = results.get("tcp") or []
+    dns_rows = results.get("dns") or []
+    download = results.get("download_test") or {}
+
+    tcp_by_host = {}
+    for t in tcp_rows:
+        h = t.get("host")
+        if not h:
+            continue
+        cur = tcp_by_host.get(h)
+        if cur is None or (t.get("failure_pct") or 0) < (cur.get("failure_pct") or 0):
+            tcp_by_host[h] = t
+
+    def _fp(row, default):
+        # failure_pct can legitimately be 0 (perfect) — `or default` would wrongly
+        # treat that as missing, so test for None explicitly.
+        v = row.get("failure_pct")
+        return default if v is None else v
+    tcp_ok_global = any(_fp(t, 100) <= 20 for t in tcp_rows) if tcp_rows else False
+    dns_ok_global = any(_fp(d, 100) <= 20 for d in dns_rows) if dns_rows else False
+    http_ok_global = bool(download.get("success")) and download.get("error") is None
+
+    per_host = []
+    for row in internet:
+        host = row.get("host")
+        loss = row.get("loss_pct") or 0
+        tcp_match = tcp_by_host.get(host)
+        tcp_fail = tcp_match.get("failure_pct") if tcp_match else None
+        # Direct evidence: a TCP target on this exact host connects reliably.
+        tcp_contradicts = tcp_match is not None and (tcp_fail or 0) <= 20 and loss >= 20
+        # Indirect evidence: no per-host TCP test, but the internet path is proven
+        # working by global TCP/HTTP success AND name resolution is healthy.
+        global_contradicts = (tcp_match is None and loss >= 20 and dns_ok_global and
+                              (tcp_ok_global or http_ok_global))
+        filtered = bool(tcp_contradicts or global_contradicts)
+        per_host.append({
+            "host": host, "label": row.get("label"), "loss_pct": loss,
+            "p95_ms": row.get("p95_ms"), "received": row.get("received"), "sent": row.get("sent"),
+            "tcp_port": tcp_match.get("port") if tcp_match else None,
+            "tcp_failure_pct": tcp_fail,
+            "tcp_attempts": tcp_match.get("attempts") if tcp_match else None,
+            "tcp_p95_ms": tcp_match.get("p95_ms") if tcp_match else None,
+            "icmp_filtered": filtered,
+            "known_rate_limiter": host in ICMP_RATE_LIMITERS,
+        })
+    return {
+        "per_host": per_host,
+        "tcp_ok_global": tcp_ok_global,
+        "dns_ok_global": dns_ok_global,
+        "http_ok_global": http_ok_global,
+        "any_filtered": any(h["icmp_filtered"] for h in per_host),
+        "filtered_hosts": [h["host"] for h in per_host if h["icmp_filtered"]],
+        "real_loss_hosts": [h["host"] for h in per_host
+                            if (h["loss_pct"] or 0) >= 5 and not h["icmp_filtered"]],
+    }
+
+
+def get_reconciliation(results):
+    # full_diagnostic caches the reconciliation on the results dict; diagnose() and
+    # health_score() may also be called standalone, so recompute on a cache miss.
+    r = results.get("icmp_reconciliation")
+    if r is None:
+        r = reconcile_icmp(results)
+    return r
 
 
 def diagnose(results):
@@ -1200,20 +1809,35 @@ def diagnose(results):
             diagnoses.append({"layer": "interface", "severity": "bad",
                               "title": "Interface errors detected",
                               "detail": "; ".join(details),
+                              "facts": ["Driver counters on this interface: " + "; ".join(details) + "."],
+                              "assumption": "Non-zero error/drop counters at the NIC mean frames are "
+                                            "being corrupted or discarded at the physical/link layer — "
+                                            "this is local hardware/cabling, upstream of any ISP issue.",
+                              "confidence": "high",
                               "fix": "Check cable connections. Try a different cable or port. "
-                                     "High overruns suggest system too slow to process packets."})
+                                     "High overruns suggest the system is too slow to process packets."})
 
     if ethtool and ethtool.get("available"):
         if ethtool.get("duplex") == "Half":
             diagnoses.append({"layer": "interface", "severity": "bad",
                               "title": "Half-duplex detected",
-                              "detail": "Interface is running at half-duplex.",
-                              "fix": "Force full-duplex on both sides of the link."})
+                              "detail": "Interface is negotiated at half-duplex.",
+                              "facts": ["ethtool reports duplex = Half on this interface."],
+                              "assumption": "Half-duplex on a modern wired link is almost always a "
+                                            "duplex-mismatch (one side auto, other forced), causing "
+                                            "late collisions and severe slowdowns under load. On WiFi, "
+                                            "ethtool duplex is often not meaningful — verify it is a wired link.",
+                              "confidence": "medium",
+                              "fix": "Force full-duplex on both sides of the link, or set both ends to auto-negotiate."})
         if ethtool.get("link_detected") is False:
             diagnoses.append({"layer": "interface", "severity": "bad",
                               "title": "No link detected",
-                              "detail": "Ethernet link appears down.",
-                              "fix": "Check cable, switch port, and interface status."})
+                              "detail": "The Ethernet link appears down.",
+                              "facts": ["ethtool reports link_detected = no."],
+                              "assumption": "No carrier means the cable/port is not establishing a link "
+                                            "at all — a purely local physical problem.",
+                              "confidence": "high",
+                              "fix": "Check the cable, switch port, and interface status."})
 
     if wifi and wifi.get("available"):
         signal = wifi.get("signal_dbm")
@@ -1221,22 +1845,41 @@ def diagnose(results):
             if signal < -80:
                 diagnoses.append({"layer": "wifi", "severity": "bad",
                                   "title": "Very weak WiFi signal",
-                                  "detail": f"Signal strength: {signal} dBm. This will cause dropouts and slow speeds.",
-                                  "fix": "Move closer to the router or add a WiFi extender/mesh node."})
+                                  "detail": f"Signal strength {signal} dBm. This will cause dropouts and slow speeds.",
+                                  "facts": [f"Measured WiFi signal: {signal} dBm (below -80 dBm)."],
+                                  "assumption": "Below about -80 dBm the link operates near its noise floor, "
+                                                "so the radio drops to low rates and retransmits heavily — "
+                                                "this looks identical to 'internet problems' from the app's view.",
+                                  "confidence": "high",
+                                  "fix": "Move closer to the router, remove obstructions, or add a WiFi extender/mesh node."})
             elif signal < -70:
                 diagnoses.append({"layer": "wifi", "severity": "warning",
                                   "title": "Weak WiFi signal",
-                                  "detail": f"Signal strength: {signal} dBm. May cause intermittent issues.",
-                                  "fix": "Move closer to the router or switch to 2.4 GHz band for range."})
+                                  "detail": f"Signal strength {signal} dBm. May cause intermittent issues.",
+                                  "facts": [f"Measured WiFi signal: {signal} dBm (-70 to -80 dBm range)."],
+                                  "assumption": "-70 to -80 dBm is marginal: usable when idle but prone to "
+                                                "stalls and first-attempt failures under load. A plausible "
+                                                "contributor to intermittent symptoms.",
+                                  "confidence": "medium",
+                                  "fix": "Move closer to the router, or test on Ethernet to rule WiFi in or out."})
             elif signal < -60:
                 diagnoses.append({"layer": "wifi", "severity": "info",
                                   "title": "Fair WiFi signal",
-                                  "detail": f"Signal strength: {signal} dBm. Adequate but not optimal for high bandwidth."})
+                                  "detail": f"Signal strength {signal} dBm. Adequate but not optimal for high bandwidth.",
+                                  "facts": [f"Measured WiFi signal: {signal} dBm (-60 to -70 dBm range)."],
+                                  "assumption": "-60 to -70 dBm is generally fine for browsing and video; it is "
+                                                "unlikely to be the primary cause of an intermittent fault.",
+                                  "confidence": "medium",
+                                  "fix": ""})
         channel_util = wifi.get("channel_util")
         if channel_util is not None and channel_util > 60:
             diagnoses.append({"layer": "wifi", "severity": "warning",
                               "title": "Crowded WiFi channel",
-                              "detail": f"Channel utilization: {channel_util}%. High congestion.",
+                              "detail": f"Channel utilization {channel_util}%. High congestion.",
+                              "facts": [f"Channel airtime utilization: {channel_util}% (busy)."],
+                              "assumption": "High airtime use means neighbours/devices are saturating the "
+                                            "channel, adding latency and jitter even with a strong signal.",
+                              "confidence": "medium",
                               "fix": "Switch to a less congested channel or upgrade to WiFi 6/6E."})
 
     tcp_status = classify_ping(gw_ping) if gw_ping else None
@@ -1251,95 +1894,224 @@ def diagnose(results):
                 detail_parts.append(f"Latency spikes: p95={gw_ping['p95_ms']}ms")
             if has_tcp_issue:
                 detail_parts.append(f"TCP retransmits: {socket_stats['total_retransmits']}")
+            gw_facts = ["Gateway ping: loss=%s%%, p95=%s ms, avg=%s ms over %s probes."
+                        % (gw_ping.get("loss_pct", 0), gw_ping.get("p95_ms", "?"),
+                           gw_ping.get("avg_ms", "?"), gw_ping.get("sent", "?"))]
+            if has_tcp_issue:
+                gw_facts.append("ss reports %s TCP retransmits on active sockets."
+                                % socket_stats.get("total_retransmits"))
             diagnose_gw = {"layer": "gateway", "severity": "bad",
                            "title": "Gateway instability detected",
                            "detail": "; ".join(detail_parts),
+                           "facts": gw_facts,
+                           "assumption": "The first hop (your own router) is already lossy or slow. "
+                                         "Because this is the local link, it is NOT an ISP fault — and it "
+                                         "makes every downstream measurement unreliable until fixed.",
+                           "confidence": "high",
                            "fix": ""}
             if wifi and wifi.get("available") and wifi.get("signal_dbm"):
                 sig = wifi["signal_dbm"]
                 if sig < -70:
                     diagnose_gw["fix"] = "Gateway latency may be caused by weak WiFi. Move closer or use Ethernet."
                 else:
-                    diagnose_gw["fix"] = "Router may be overloaded. Reduce active downloads, reboot router, or check QoS settings."
+                    diagnose_gw["fix"] = "Router may be overloaded. Reduce active downloads, reboot the router, or check QoS settings."
             else:
-                diagnose_gw["fix"] = "Router may be overloaded. Reduce active downloads, reboot router, or check QoS settings."
+                diagnose_gw["fix"] = "Router may be overloaded. Reduce active downloads, reboot the router, or check QoS settings."
             diagnoses.append(diagnose_gw)
         elif status == "clean":
             diagnoses.append({"layer": "gateway", "severity": "clean",
-                              "title": "Gateway stable",
-                              "detail": f"p95={gw_ping.get('p95_ms', '?')}ms, loss={gw_ping.get('loss_pct', 0)}%",
+                              "title": "Gateway (local router) stable",
+                              "detail": f"p95={gw_ping.get('p95_ms', '?')} ms, loss={gw_ping.get('loss_pct', 0)}%",
+                              "facts": ["Gateway ping: loss=%s%%, p95=%s ms, avg=%s ms over %s probes."
+                                        % (gw_ping.get("loss_pct", 0), gw_ping.get("p95_ms", "?"),
+                                           gw_ping.get("avg_ms", "?"), gw_ping.get("sent", "?"))],
+                              "assumption": "A clean first hop means your local LAN/WiFi and router are "
+                                            "healthy, so any genuine problem is upstream (ISP) rather than local.",
+                              "confidence": "high",
                               "fix": ""})
 
-    bad_internet = [x for x in internet_pings if classify_ping(x) != "clean"]
-    if bad_internet and gw_ping and classify_ping(gw_ping) == "clean":
-        for row in bad_internet:
-            s = classify_ping(row)
-            detail = f"loss={row.get('loss_pct', 0)}%, p95={row.get('p95_ms', '?')}ms, jitter={row.get('jitter_ms', '?')}ms"
-            diagnoses.append({"layer": "internet", "severity": "bad",
-                              "title": f"External instability: {row['label']}",
-                              "detail": detail,
-                              "fix": "Gateway is clean but external pings are unstable. Likely ISP or upstream routing issue. "
-                                     "Contact your ISP with the MTR trace results."})
-    elif bad_internet and gw_ping and classify_ping(gw_ping) != "clean":
-        diagnoses.append({"layer": "meta", "severity": "warning",
-                          "title": "Both local and internet unstable",
-                          "detail": "Gateway and external pings both show issues.",
-                          "fix": "Fix the local network issue first (see gateway diagnosis), then re-test internet."})
+    recon = get_reconciliation(results)
+    per_host = recon["per_host"]
+    filtered_set = set(recon["filtered_hosts"])
+
+    # The "really 95% packet loss?" case: ICMP loss the working TCP layer disproves.
+    icmp_filtered = [h for h in per_host if h["icmp_filtered"]]
+    if icmp_filtered:
+        hosts_str = ", ".join(h["host"] for h in icmp_filtered)
+        facts = []
+        for h in icmp_filtered:
+            facts.append("ICMP ping to %s: %s%% loss (%s of %s echo replies returned)."
+                         % (h["host"], h["loss_pct"], h.get("received"), h.get("sent")))
+            if h.get("tcp_failure_pct") is not None:
+                facts.append("TCP handshake to %s:%s succeeded %s%% of the time over %s attempts."
+                             % (h["host"], h.get("tcp_port"),
+                                round(100 - (h["tcp_failure_pct"] or 0), 1), h.get("tcp_attempts")))
+        if recon["http_ok_global"]:
+            facts.append("HTTPS downloads over the same connection completed successfully.")
+        if recon["dns_ok_global"]:
+            facts.append("DNS name resolution succeeded on the same connection.")
+        diagnoses.append({
+            "layer": "internet", "severity": "info",
+            "title": "High ICMP \"loss\" is rate-limiting, not packet loss",
+            "detail": "Ping to %s reports high loss, but TCP/HTTPS to those same addresses connect "
+                      "fine. These public resolvers throttle ICMP echo to shed load." % hosts_str,
+            "facts": facts,
+            "assumption": "A real high packet-loss rate cannot coexist with a near-100% TCP "
+                          "handshake success rate, because a handshake needs several consecutive "
+                          "round trips to complete. The missing replies are deprioritized by the "
+                          "destination, not lost on your line. (1.1.1.1 / 8.8.8.8 / 9.9.9.9 are "
+                          "known to rate-limit ICMP by policy.)",
+            "confidence": "high",
+            "fix": "Disregard the ICMP loss figure for these public resolvers. Judge real loss from "
+                   "the gateway ping, the TCP connection tests, and the reliability probe instead."})
+
+    # Hosts whose loss is NOT explained by rate-limiting — treat as genuine.
+    real_bad = [row for row in internet_pings
+                if row.get("host") not in filtered_set and classify_ping(row) != "clean"]
+    gw_clean = bool(gw_ping) and classify_ping(gw_ping) == "clean"
+    if real_bad and gw_clean:
+        for row in real_bad:
+            loss = row.get("loss_pct", 0)
+            p95 = row.get("p95_ms")
+            tcp_match = next((h for h in per_host if h["host"] == row.get("host")), None)
+            facts = ["ICMP ping to %s: %s%% loss, p95 %s ms, jitter %s ms."
+                     % (row.get("label"), loss, p95, row.get("jitter_ms"))]
+            if tcp_match and tcp_match.get("tcp_failure_pct") is not None:
+                facts.append("TCP to %s:%s also degraded: %s%% connect failure."
+                             % (row.get("host"), tcp_match.get("tcp_port"), tcp_match["tcp_failure_pct"]))
+            sev = "bad" if (loss or 0) >= 5 else "warning"
+            diagnoses.append({
+                "layer": "internet", "severity": sev,
+                "title": "External path unstable: %s" % row.get("label"),
+                "detail": "loss=%s%%, p95=%s ms, jitter=%s ms" % (loss, p95, row.get("jitter_ms")),
+                "facts": facts,
+                "assumption": "The gateway ping is clean while this external host is not, so the "
+                              "instability is upstream of your router (ISP or transit), not your "
+                              "local LAN/WiFi.",
+                "confidence": "medium",
+                "fix": "Likely an ISP or upstream routing issue. Share the MTR trace and these "
+                       "measurements with your ISP."})
+    elif real_bad and gw_ping and not gw_clean:
+        diagnoses.append({
+            "layer": "meta", "severity": "warning",
+            "title": "Both local and internet unstable",
+            "detail": "Gateway and external hosts both show genuine instability.",
+            "facts": ["Gateway ping: loss=%s%%, p95=%s ms." % (gw_ping.get("loss_pct"), gw_ping.get("p95_ms"))]
+                     + ["%s: loss=%s%%, p95=%s ms." % (r.get("label"), r.get("loss_pct"), r.get("p95_ms"))
+                        for r in real_bad],
+            "assumption": "When the local hop is already unstable, the external numbers are "
+                          "unreliable until the local issue is resolved.",
+            "confidence": "medium",
+            "fix": "Fix the local network issue first (see the gateway finding), then re-test the internet."})
 
     if mtr_result and mtr_result.get("hops"):
         hops = mtr_result["hops"]
-        first_loss_hop = None
-        for hop in hops:
-            if hop.get("loss_pct", 0) > 5:
-                first_loss_hop = hop
+        last = hops[-1] if hops else {}
+        dest_loss = last.get("loss_pct", 0) or 0
+        # Intermediate-hop loss that does NOT persist to the destination is that
+        # router rate-limiting its own ICMP responses (same mechanism as 1.1.1.1) —
+        # it is NOT packet loss on your path. Only loss that reaches the final hop
+        # is real end-to-end loss. This is the cardinal rule of reading an MTR trace.
+        first_mid = None
+        for hop in hops[:-1]:
+            if (hop.get("loss_pct", 0) or 0) > 5:
+                first_mid = hop
                 break
-        if first_loss_hop:
-            hop_num = first_loss_hop["hop"]
-            detail = f"Loss of {first_loss_hop['loss_pct']}% starts at hop {hop_num}"
+        if dest_loss > 5:
+            culprit = first_mid or last
+            hop_num = culprit["hop"]
+            facts = ["Destination hop %s shows %s%% loss (loss reaches the endpoint)." % (last.get("hop"), dest_loss)]
+            if first_mid:
+                facts.append("Loss first appears at hop %s (%s%%) and persists to the destination."
+                             % (first_mid["hop"], first_mid.get("loss_pct")))
             if hop_num <= 2:
                 diagnoses.append({"layer": "isp", "severity": "bad",
-                                  "title": "Packet loss at first hops",
-                                  "detail": detail,
-                                  "fix": "Loss at hops 1-2 suggests modem or local uplink issue. "
-                                         "Restart modem/gateway. Check for signal issues on the line."})
+                                  "title": "Real packet loss starting at the first hops",
+                                  "detail": "End-to-end loss begins at hop %s and reaches the destination." % hop_num,
+                                  "facts": facts,
+                                  "assumption": "Loss that starts at hops 1-2 AND persists to the destination "
+                                                "points to your modem or local uplink (e.g. line/signal quality).",
+                                  "confidence": "high",
+                                  "fix": "Restart the modem/gateway and check for line/signal issues. "
+                                         "If it persists, this is evidence for your ISP."})
             else:
                 diagnoses.append({"layer": "isp", "severity": "bad",
-                                  "title": "Packet loss at ISP hops",
-                                  "detail": detail,
-                                  "fix": f"Loss starts at hop {hop_num}, which is in the ISP network. "
-                                         "Contact your ISP and share this trace. Consider providing the full MTR output."})
+                                  "title": "Real packet loss in the ISP/transit network",
+                                  "detail": "End-to-end loss begins at hop %s (inside the provider network)." % hop_num,
+                                  "facts": facts,
+                                  "assumption": "Loss that starts at hop %s and persists to the destination is "
+                                                "upstream of your home — an ISP or transit problem, not your "
+                                                "equipment." % hop_num,
+                                  "confidence": "high",
+                                  "fix": "Contact your ISP and share this trace and the full MTR output."})
+        elif first_mid:
+            diagnoses.append({"layer": "isp", "severity": "info",
+                              "title": "Mid-route hop shows ICMP loss, but the destination is clean",
+                              "detail": "Hop %s reports %s%% loss while the final hop shows %s%%."
+                                        % (first_mid["hop"], first_mid.get("loss_pct"), dest_loss),
+                              "facts": ["Hop %s: %s%% loss." % (first_mid["hop"], first_mid.get("loss_pct")),
+                                        "Destination hop %s: %s%% loss." % (last.get("hop"), dest_loss)],
+                              "assumption": "Because the loss clears by the destination, that intermediate "
+                                            "router is simply rate-limiting its own ICMP replies — it is NOT "
+                                            "dropping your traffic. This is the most common false alarm in a "
+                                            "traceroute and should not be reported to an ISP as packet loss.",
+                              "confidence": "high",
+                              "fix": "No action needed — disregard the mid-route loss figure."})
 
     if bufferbloat_blob and bufferbloat_blob.get("available"):
         ratio = bufferbloat_blob.get("ratio")
+        bb_facts = ["Idle RTT %s ms vs loaded RTT %s ms (ratio %sx)." % (
+            bufferbloat_blob.get("rtt_idle_ms"), bufferbloat_blob.get("rtt_loaded_ms"),
+            ("%.1f" % ratio) if ratio else "?")]
         if ratio and ratio > 3:
             diagnoses.append({"layer": "bufferbloat", "severity": "bad",
                               "title": "Severe bufferbloat detected",
                               "detail": f"Latency under load is {ratio:.1f}x idle latency (idle: {bufferbloat_blob.get('rtt_idle_ms')}ms, loaded: {bufferbloat_blob.get('rtt_loaded_ms')}ms)",
+                              "facts": bb_facts,
+                              "assumption": "Latency ballooning under load means oversized buffers are "
+                                            "queuing packets during saturation — this is what makes calls/games "
+                                            "stutter while a download runs, even on a 'fast' line.",
+                              "confidence": "high",
                               "fix": "Enable SQM/fq_codel on your router. On Linux: tc qdisc add dev eth0 root fq_codel. "
                                      "On OpenWrt: install luci-app-sqm."})
         elif ratio and ratio > 2:
             diagnoses.append({"layer": "bufferbloat", "severity": "warning",
                               "title": "Mild bufferbloat detected",
                               "detail": f"Latency under load is {ratio:.1f}x idle latency",
+                              "facts": bb_facts,
+                              "assumption": "A moderate latency rise under load; noticeable in latency-sensitive "
+                                            "apps during heavy uploads but not severe.",
+                              "confidence": "medium",
                               "fix": "Consider enabling SQM or reducing concurrent uploads during latency-sensitive use."})
 
     dns_bad = [x for x in dns_results if (x.get("failure_pct") or 0) > 0 or (x.get("p95_ms") or 0) > 300]
     if dns_bad:
         names = ", ".join(x["host"] for x in dns_bad)
         diagnoses.append({"layer": "dns", "severity": "bad",
-                          "title": "DNS instability detected",
+                          "title": "DNS resolution unreliable or slow",
                           "detail": f"Affected: {names}",
-                          "fix": "Try using a different DNS resolver like 1.1.1.1 or 8.8.8.8. "
-                                 "If using router DNS forwarding, bypass it."})
+                          "facts": ["%s: %s%% lookups failed, p95 %s ms." % (
+                              x.get("host"), x.get("failure_pct", 0), x.get("p95_ms", "?")) for x in dns_bad],
+                          "assumption": "Failed or slow name resolution makes sites feel down or slow to "
+                                        "start even when the underlying connection is fine — a classic "
+                                        "'first attempt fails, reload works' cause.",
+                          "confidence": "high",
+                          "fix": "Switch to a different resolver such as 1.1.1.1 or 8.8.8.8. "
+                                 "If your router forwards DNS, bypass it."})
 
     tcp_bad = [x for x in tcp_results if (x.get("failure_pct") or 0) > 0 or (x.get("p95_ms") or 0) > 500]
     if tcp_bad:
         names = ", ".join(f"{x['host']}:{x['port']}" for x in tcp_bad)
         diagnoses.append({"layer": "tcp", "severity": "bad",
-                          "title": "TCP connection instability",
+                          "title": "TCP connections failing or slow to establish",
                           "detail": f"Affected: {names}",
-                          "fix": "Web browsing, video calls, or app logins may feel unreliable. "
-                                 "Check for firewall blocking or ISP throttling."})
+                          "facts": ["%s:%s: %s%% connect failure, p95 %s ms." % (
+                              x.get("host"), x.get("port"), x.get("failure_pct", 0), x.get("p95_ms", "?")) for x in tcp_bad],
+                          "assumption": "TCP is the transport real apps use. Failures or slow handshakes here "
+                                        "(unlike ICMP loss) DO mean web/video/app connections will feel unreliable.",
+                          "confidence": "high",
+                          "fix": "Check for a firewall blocking the port or ISP throttling; "
+                                 "compare wired vs WiFi to localize."})
 
     if iperf_result and iperf_result.get("available") and not iperf_result.get("error"):
         retrans_pct = iperf_result.get("retransmit_pct", 0)
@@ -1347,48 +2119,147 @@ def diagnose(results):
             diagnoses.append({"layer": "tcp", "severity": "warning",
                               "title": "High TCP retransmits in iPerf3",
                               "detail": f"Retransmits: {retrans_pct:.1f}% during throughput test",
+                              "facts": ["iPerf3 retransmits: %.1f%% of segments during the throughput test." % retrans_pct],
+                              "assumption": "Elevated retransmits on a sustained transfer indicate the "
+                                            "path is dropping TCP segments under load.",
+                              "confidence": "medium",
                               "fix": "High retransmits suggest congestion, throttling, or line quality issues."})
+    elif iperf_result and iperf_result.get("available") and iperf_result.get("error"):
+        diagnoses.append({
+            "layer": "internet", "severity": "info",
+            "title": "iPerf3 throughput test could not complete",
+            "detail": "The public iPerf3 server did not return a result.",
+            "facts": ["iPerf3 to %s errored: %s" % (
+                iperf_result.get("server", IPERF_SERVER), str(iperf_result.get("error"))[:120])],
+            "assumption": "Public iPerf3 servers are frequently busy or rate-limited; a failure here "
+                          "almost always reflects the server's availability, NOT a fault in your line.",
+            "confidence": "high",
+            "fix": "Treat this test as inconclusive. Use the speed test and download test for capacity."})
+
+    speed_result = results.get("speedtest")
+    if speed_result and speed_result.get("available"):
+        dl = speed_result.get("download_mbps")
+        if speed_result.get("error") or dl is None:
+            diagnoses.append({
+                "layer": "internet", "severity": "info",
+                "title": "Speed test could not complete",
+                "detail": "The speed test did not return a measurement.",
+                "facts": ["Speed test tool: %s." % speed_result.get("tool", "?")],
+                "assumption": "A failed speed test is a tool/server problem, not proof of zero "
+                              "bandwidth. Do not read a missing or '0 Mbps' result as a dead connection.",
+                "confidence": "medium",
+                "fix": "Re-run, or install the Ookla speedtest CLI for a reliable measurement."})
+        elif dl < 10:
+            diagnoses.append({
+                "layer": "internet", "severity": "warning",
+                "title": "Low measured download speed",
+                "detail": "Speed test download: %s Mbps." % dl,
+                "facts": ["Download %s Mbps, upload %s Mbps (%s)." % (
+                    dl, speed_result.get("upload_mbps", "?"), speed_result.get("tool", "?"))],
+                "assumption": "This is a real bandwidth measurement (unlike the small-image test). A "
+                              "low figure may reflect your plan's cap, WiFi, or congestion.",
+                "confidence": "medium",
+                "fix": "Compare against your subscribed plan speed; test wired vs WiFi to isolate."})
 
     download_result = results.get("download_test")
     if download_result and download_result.get("error") is None:
         mbps = download_result.get("avg_mbps", 0)
         success = download_result.get("success", 0)
         failures = download_result.get("failures", 0)
-        if mbps < 1 and failures > 0:
-            diagnoses.append({"layer": "internet", "severity": "bad",
-                              "title": "Image download test failed",
-                              "detail": f"{success}/{success+failures} images downloaded, {mbps} Mbps",
-                              "fix": "Check internet connectivity. Very low download throughput."})
-        elif mbps < 5:
-            diagnoses.append({"layer": "internet", "severity": "warning",
-                              "title": "Low download throughput",
-                              "detail": f"{mbps} Mbps average over {success} images",
-                              "fix": "Slow internet connection may impact streaming and large file transfers."})
+        total_imgs = success + failures
+        fail_pct = round(100 * failures / total_imgs, 1) if total_imgs else 0
+        thr_facts = ["%s of %s small images fetched; aggregate rate %s Mbps." % (success, total_imgs, mbps)]
+        if download_result.get("p95_latency_ms") is not None:
+            thr_facts.append("p95 per-image latency: %s ms." % download_result["p95_latency_ms"])
+        if failures > 0:
+            sev = "bad" if fail_pct >= 20 else "warning"
+            diagnoses.append({
+                "layer": "internet", "severity": sev,
+                "title": "Some image downloads failed (%s%%)" % fail_pct,
+                "detail": "%s of %s small images failed to download." % (failures, total_imgs),
+                "facts": thr_facts,
+                "assumption": "Repeated small-object fetch failures point to an intermittent "
+                              "connection problem — drops under concurrency, DNS hiccups, or a flaky "
+                              "link — rather than a slow connection.",
+                "confidence": "medium",
+                "fix": "Run the intermittent-connection reproduction (10 images x 100 sites) to "
+                       "localize the pattern, then attach the result to your ISP ticket."})
         else:
-            diagnoses.append({"layer": "internet", "severity": "clean",
-                              "title": "Download throughput OK",
-                              "detail": f"{mbps} Mbps average, {success}/{success+failures} successful",
-                              "fix": ""})
+            diagnoses.append({
+                "layer": "internet", "severity": "clean",
+                "title": "Image downloads all succeeded",
+                "detail": "%s of %s small images downloaded (aggregate %s Mbps)." % (success, total_imgs, mbps),
+                "facts": thr_facts,
+                "assumption": "This figure is the aggregate rate of many tiny concurrent images from "
+                              "a single image host. It reflects per-request latency and that host's "
+                              "limits, NOT your link's bandwidth — use the speed test for capacity. A "
+                              "low number here with zero failures is expected and not a fault.",
+                "confidence": "high",
+                "fix": ""})
 
     conn_result = results.get("connection_test")
     if conn_result:
         http_lat = conn_result.get("http_latency", [])
         for h in http_lat:
-            fail = h.get("failures", 0)
+            fail = h.get("failures", 0) or 0
             p95 = h.get("p95_ms")
-            if p95 and p95 > 500:
-                diagnoses.append({"layer": "internet", "severity": "warning",
-                                  "title": f"High HTTP latency: {h['host']}",
-                                  "detail": f"p95={p95:.0f}ms, {fail} failures",
-                                  "fix": "Web pages may load slowly. Check for DNS or routing issues."})
+            attempts = fail + len(h.get("latencies", []) or [])
+            if fail > 0:
+                diagnoses.append({
+                    "layer": "internet", "severity": "warning",
+                    "title": "HTTP requests intermittently failing: %s" % h.get("host"),
+                    "detail": "%s of %s HTTP requests to %s failed." % (fail, attempts or "?", h.get("host")),
+                    "facts": ["HTTP HEAD to %s: %s failure(s)%s." % (
+                        h.get("host"), fail, (", p95 %.0f ms" % p95) if p95 else "")],
+                    "assumption": "A host that answers some requests but not others indicates an "
+                                  "intermittent connection or a loaded endpoint, not a hard outage. "
+                                  "Note this probe uses plain HTTP, which some networks block or "
+                                  "redirect — confirm with the reliability probe before blaming the line.",
+                    "confidence": "medium",
+                    "fix": "Re-run the reliability / intermittent-connection probe: if first attempts "
+                           "fail and retries succeed, it is an intermittent-connection issue to localize."})
+            elif p95 and p95 > 500:
+                diagnoses.append({
+                    "layer": "internet", "severity": "warning",
+                    "title": "High HTTP latency: %s" % h.get("host"),
+                    "detail": "p95=%.0f ms over %s requests" % (p95, attempts),
+                    "facts": ["HTTP HEAD to %s: p95 %.0f ms, 0 failures." % (h.get("host"), p95)],
+                    "assumption": "Consistently slow responses without failures usually mean a slow "
+                                  "path or distant CDN edge, not packet loss.",
+                    "confidence": "low",
+                    "fix": "Web pages may load slowly. Check for DNS or routing detours."})
         mtu = conn_result.get("mtu", {})
         if mtu.get("available"):
             mtu_val = mtu.get("mtu", 1500)
             if mtu_val < 1400:
                 diagnoses.append({"layer": "interface", "severity": "warning",
-                                  "title": f"Low path MTU: {mtu_val}",
-                                  "detail": f"MTU of {mtu_val} may reduce throughput for large transfers",
-                                  "fix": "Check for VPN overhead or PPPoE encapsulation reducing MTU."})
+                                  "title": f"Low path MTU: {mtu_val} bytes",
+                                  "detail": f"Largest unfragmented packet is {mtu_val} bytes (below the usual 1500).",
+                                  "facts": ["Path MTU probe: %s bytes (standard Ethernet is 1500)." % mtu_val],
+                                  "assumption": "A reduced path MTU usually comes from VPN or PPPoE "
+                                                "encapsulation overhead. If MSS is not clamped it can cause "
+                                                "large transfers to stall while small requests work — another "
+                                                "intermittent-feeling symptom.",
+                                  "confidence": "medium",
+                                  "fix": "Enable MSS clamping on the router, or reduce the interface MTU to match "
+                                         "the path (check VPN/PPPoE overhead)."})
+
+    rel_result = results.get("reliability_test")
+    if rel_result and rel_result.get("available"):
+        for v in rel_result.get("verdict", []):
+            if v.get("severity") != "clean":
+                diagnoses.append(dict(v))
+
+    wk_result = results.get("wellknown_test")
+    if wk_result and wk_result.get("available"):
+        # The site-fleet headline is always informative — keep its clean verdict too
+        # (it is the user's evidence that the 'many small images' pattern works).
+        wkv = wk_result.get("verdict", [])
+        if wkv:
+            diagnoses.append(dict(wkv[0]))
+            for v in wkv[1:]:
+                if v.get("severity") != "clean":
+                    diagnoses.append(dict(v))
 
     clean_layers = [d for d in diagnoses if d["severity"] == "clean"]
     if len(clean_layers) == len(diagnoses) and diagnoses:
@@ -1427,11 +2298,21 @@ def health_score(results):
         scores["gateway"] = max(0, 100 - (loss * 8) - (max(0, p95 - 10) * 0.5))
     internet = results.get("internet_ping", [])
     if internet:
+        recon = get_reconciliation(results)
+        filtered = set(recon.get("filtered_hosts", []))
+        per_host = {h["host"]: h for h in recon.get("per_host", [])}
         internet_scores = []
         for row in internet:
-            loss = row.get("loss_pct", 0)
-            p95 = row.get("p95_ms", 0)
-            internet_scores.append(max(0, 100 - (loss * 8) - (max(0, p95 - 40) * 0.3)))
+            host = row.get("host")
+            if host in filtered:
+                # ICMP loss here is rate-limiting, not real loss — score the path by
+                # actual TCP reachability instead of the phantom ICMP figure.
+                tcp_fail = (per_host.get(host, {}) or {}).get("tcp_failure_pct")
+                internet_scores.append(max(0, 100 - (tcp_fail or 0) * 1.5))
+            else:
+                loss = row.get("loss_pct", 0) or 0
+                p95 = row.get("p95_ms", 0) or 0
+                internet_scores.append(max(0, 100 - (loss * 8) - (max(0, p95 - 40) * 0.3)))
         scores["internet"] = statistics.mean(internet_scores) if internet_scores else 0
     dns = results.get("dns", [])
     if dns:
@@ -1527,10 +2408,18 @@ def write_report(path, results):
     lines.append(f"Health score: {results.get('health_score', '?')}/100")
     lines.append("")
     lines.append("Diagnosis:")
+    lines.append("(Facts are measured; interpretation is what we infer from them.)")
     for d in results.get("diagnosis", []):
-        lines.append(f"- [{d['severity']}] [{d['layer']}] {d['title']}: {d['detail']}")
+        conf = f" (confidence: {d['confidence']})" if d.get("confidence") else ""
+        lines.append(f"- [{d['severity']}] [{d['layer']}] {d['title']}{conf}")
+        if d.get("detail"):
+            lines.append(f"    {d['detail']}")
+        for f in d.get("facts", []):
+            lines.append(f"    FACT: {f}")
+        if d.get("assumption"):
+            lines.append(f"    INTERPRETATION: {d['assumption']}")
         if d.get("fix"):
-            lines.append(f"  Fix: {d['fix']}")
+            lines.append(f"    FIX: {d['fix']}")
     lines.append("")
     lines.append("Ping summary:")
     for row in ping_summary_rows(results):
@@ -1553,16 +2442,196 @@ def write_report(path, results):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _sev_label(s):
+    return {"bad": "PROBLEM", "warning": "WARNING", "info": "NOTE", "clean": "OK"}.get(s, s.upper())
+
+
+def build_isp_report(results):
+    # A detailed, plain-language evidence report a customer can attach to an ISP
+    # ticket. It leads with the ICMP-vs-TCP method note so an engineer cannot
+    # dismiss the report by pointing out that ping loss to 1.1.1.1 is normal, and it
+    # clearly separates what is the customer's equipment from what is upstream.
+    L = []
+    diag = results.get("diagnosis", []) or []
+    recon = get_reconciliation(results)
+    sev_of = {d.get("severity") for d in diag}
+
+    def head(t):
+        L.append("")
+        L.append("=" * 72)
+        L.append(t)
+        L.append("=" * 72)
+
+    L.append("NETWORK DIAGNOSTIC EVIDENCE REPORT")
+    L.append("Prepared for submission to the Internet Service Provider")
+    L.append("")
+    L.append("Generated:   %s" % results.get("timestamp", "?"))
+    L.append("Tool:        NetDiag automated network diagnostics")
+    L.append("Health score: %s/100 (0 = unusable, 100 = perfect)" % results.get("health_score", "?"))
+
+    head("1. CONNECTION UNDER TEST")
+    L.append("Operating system:   %s" % results.get("platform", results.get("os", "?")))
+    L.append("Local interface:    %s" % (results.get("default_interface") or "not detected"))
+    L.append("Default gateway:    %s (the customer's own router/modem)" % (results.get("gateway") or "not detected"))
+    wifi = results.get("wifi") or {}
+    if wifi.get("available") and wifi.get("signal_dbm") is not None:
+        L.append("WiFi signal:        %s dBm" % wifi.get("signal_dbm"))
+
+    head("2. HOW TO READ THIS REPORT (METHOD NOTE)")
+    L.append("This report distinguishes ICMP 'ping' loss from REAL packet loss.")
+    L.append("")
+    L.append("Public resolvers such as 1.1.1.1, 8.8.8.8 and 9.9.9.9 intentionally")
+    L.append("rate-limit ICMP echo (ping) to shed load. A high ping-loss number to")
+    L.append("those addresses is therefore NOT evidence of packet loss when TCP and")
+    L.append("HTTPS connections to the SAME addresses succeed (a TCP handshake needs")
+    L.append("several consecutive round trips, so it cannot succeed through real high")
+    L.append("loss). Every figure below already accounts for this distinction, so the")
+    L.append("findings reflect genuine problems only.")
+    if recon.get("filtered_hosts"):
+        L.append("")
+        L.append("In this run, the following hosts showed rate-limited ICMP (ignored as")
+        L.append("packet loss): %s" % ", ".join(recon["filtered_hosts"]))
+
+    head("3. LOCAL EQUIPMENT vs UPSTREAM (ISP) ATTRIBUTION")
+    gw = results.get("gateway_ping") or {}
+    local_bad = [d for d in diag if d.get("layer") in ("interface", "wifi") and d.get("severity") in ("bad", "warning")]
+    gw_status = classify_ping(gw) if gw else None
+    if gw and gw_status == "clean" and not local_bad:
+        L.append("LOCAL NETWORK: HEALTHY.")
+        L.append("  The first hop (the customer's router) responds cleanly (loss %s%%," % gw.get("loss_pct", "?"))
+        L.append("  p95 %s ms) and no interface/WiFi faults were found. Any genuine" % gw.get("p95_ms", "?"))
+        L.append("  problem below is therefore UPSTREAM of the customer's equipment.")
+    else:
+        L.append("LOCAL NETWORK: ISSUES PRESENT (see findings).")
+        if gw:
+            L.append("  Gateway ping: loss %s%%, p95 %s ms." % (gw.get("loss_pct", "?"), gw.get("p95_ms", "?")))
+        for d in local_bad:
+            L.append("  - %s: %s" % (d.get("title"), d.get("detail")))
+        L.append("  Note: local issues should be resolved first, as they can mask or")
+        L.append("  mimic upstream problems.")
+    upstream_bad = [d for d in diag if d.get("layer") in ("isp", "internet") and d.get("severity") == "bad"]
+    if upstream_bad:
+        L.append("")
+        L.append("UPSTREAM (ISP/transit): GENUINE PROBLEMS DETECTED:")
+        for d in upstream_bad:
+            L.append("  - %s: %s" % (d.get("title"), d.get("detail")))
+
+    head("4. FINDINGS (EVIDENCE)")
+    ranked = sorted(diag, key=lambda d: {"bad": 0, "warning": 1, "info": 2, "clean": 3}.get(d.get("severity"), 2))
+    nontrivial = [d for d in ranked if d.get("severity") != "clean"] or ranked
+    for i, d in enumerate(nontrivial, 1):
+        conf = " | confidence: %s" % d["confidence"] if d.get("confidence") else ""
+        L.append("")
+        L.append("%d. [%s] %s%s" % (i, _sev_label(d.get("severity")), d.get("title"), conf))
+        L.append("   Layer: %s" % d.get("layer"))
+        if d.get("detail"):
+            L.append("   Summary: %s" % d["detail"])
+        for f in d.get("facts", []):
+            L.append("   - MEASURED: %s" % f)
+        if d.get("assumption"):
+            L.append("   - INTERPRETATION: %s" % d["assumption"])
+        if d.get("fix"):
+            L.append("   - SUGGESTED ACTION: %s" % d["fix"])
+
+    head("5. RAW MEASUREMENTS")
+    if gw:
+        L.append("Gateway (hop 1) ping: sent=%s, loss=%s%%, min/avg/p95/max = %s/%s/%s/%s ms, jitter=%s ms"
+                 % (gw.get("sent", "?"), gw.get("loss_pct", "?"), gw.get("min_ms", "?"), gw.get("avg_ms", "?"),
+                    gw.get("p95_ms", "?"), gw.get("max_ms", "?"), gw.get("jitter_ms", "?")))
+    L.append("")
+    L.append("External hosts — ICMP ping vs TCP connection (side by side):")
+    L.append("  %-16s %-22s %-22s %s" % ("HOST", "ICMP PING", "TCP CONNECT", "VERDICT"))
+    per_host = {h["host"]: h for h in recon.get("per_host", [])}
+    for p in results.get("internet_ping", []) or []:
+        h = per_host.get(p.get("host"), {})
+        icmp = "%s%% loss, p95 %sms" % (p.get("loss_pct", "?"), p.get("p95_ms", "?"))
+        if h.get("tcp_failure_pct") is not None:
+            tcp = "%s%% fail/%s tries" % (h.get("tcp_failure_pct"), h.get("tcp_attempts"))
+        else:
+            tcp = "not tested"
+        verdict = "ICMP rate-limited (ignore loss)" if h.get("icmp_filtered") else (
+            "real loss" if (p.get("loss_pct") or 0) >= 5 else "ok")
+        L.append("  %-16s %-22s %-22s %s" % (p.get("label", "?"), icmp, tcp, verdict))
+    dns = results.get("dns", []) or []
+    if dns:
+        L.append("")
+        L.append("DNS resolution:")
+        for d in dns:
+            L.append("  %-18s %s%% fail, p95 %s ms" % (d.get("host"), d.get("failure_pct", "?"), d.get("p95_ms", "?")))
+    mtr = results.get("mtr") or {}
+    if mtr.get("hops"):
+        L.append("")
+        L.append("Route trace (MTR) — full per-hop, %s:" % mtr.get("host", "?"))
+        for h in mtr["hops"]:
+            L.append("  hop %-3s loss=%-5s%% avg=%s ms" % (h.get("hop"), h.get("loss_pct"), h.get("avg_ms")))
+        L.append("  (Reminder: loss at a middle hop that clears by the final hop is that")
+        L.append("   router rate-limiting ICMP, not packet loss. Only loss reaching the")
+        L.append("   destination hop is real end-to-end loss.)")
+    bb = results.get("bufferbloat") or {}
+    if bb.get("available") and bb.get("ratio") is not None:
+        L.append("")
+        L.append("Bufferbloat: idle %s ms vs loaded %s ms (ratio %.1fx)"
+                 % (bb.get("rtt_idle_ms"), bb.get("rtt_loaded_ms"), bb.get("ratio")))
+    sp = results.get("speedtest") or {}
+    if sp.get("available") and sp.get("download_mbps") is not None:
+        L.append("")
+        L.append("Speed test: %s Mbps down, %s Mbps up (%s)"
+                 % (sp.get("download_mbps"), sp.get("upload_mbps", "?"), sp.get("tool", "?")))
+    rel = results.get("reliability_test") or {}
+    if rel.get("available"):
+        L.append("")
+        L.append("Intermittent-connection probe: %s samples, %s%% first-attempt failures, "
+                 "%s recovered on retry, %s hard failures."
+                 % (rel.get("samples_total", "?"), rel.get("first_attempt_fail_pct", "?"),
+                    rel.get("recovered_on_retry", "?"), rel.get("hard_failures", "?")))
+    wk = results.get("wellknown_test") or {}
+    if wk.get("available"):
+        L.append("")
+        L.append("100-site intermittent reproduction (small images from %s well-known sites):"
+                 % wk.get("site_count", "?"))
+        L.append("  %s attempts, %s%% first-attempt failures, %s recovered on retry, %s hard failures."
+                 % (wk.get("samples_total", "?"), wk.get("first_attempt_fail_pct", "?"),
+                    wk.get("recovered_on_retry", "?"), wk.get("hard_failures", "?")))
+        worst = sorted(wk.get("by_target", []) or [], key=lambda t: -(t.get("first_fail_pct") or 0))
+        worst = [t for t in worst if (t.get("first_fail_pct") or 0) > 0][:8]
+        for t in worst:
+            L.append("    %-22s %.0f%% first-attempt fail (%s samples)"
+                     % (t.get("host"), t.get("first_fail_pct") or 0, t.get("samples")))
+
+    head("6. WHAT WE ASK THE ISP TO CHECK")
+    asks = []
+    for d in diag:
+        if d.get("layer") == "isp" and d.get("severity") == "bad":
+            asks.append("Investigate packet loss on your network: %s" % d.get("detail"))
+        if d.get("layer") == "internet" and d.get("severity") == "bad" and "External path" in (d.get("title") or ""):
+            asks.append("Investigate routing/upstream instability: %s" % d.get("detail"))
+    if "bad" not in sev_of and "warning" not in sev_of:
+        asks.append("No upstream fault was reproduced during this run. If the problem is")
+        asks.append("intermittent, please keep this report and run again during an episode.")
+    if not asks:
+        asks.append("Review the findings in section 4 and the raw measurements in section 5.")
+    for a in asks:
+        L.append("  - %s" % a)
+    L.append("")
+    L.append("Report ends. Generated by NetDiag.")
+    return "\n".join(L)
+
+
 def print_console_summary(results, outdir):
     print(f"\nHealth score: {results.get('health_score', '?')}/100")
     print("\nDiagnosis:")
     for d in results.get("diagnosis", []):
         icon = {"clean": "  ", "info": "  ", "warning": "! ", "bad": "!!"}.get(d["severity"], "  ")
-        print(f"  {icon}[{d['layer']}] {d['title']}")
+        conf = f" (confidence: {d['confidence']})" if d.get("confidence") else ""
+        print(f"  {icon}[{d['layer']}] {d['title']}{conf}")
         if d.get("detail"):
             print(f"      {d['detail']}")
+        for f in d.get("facts", []):
+            print(f"      fact: {f}")
+        if d.get("assumption"):
+            print(f"      interpretation: {d['assumption']}")
         if d.get("fix"):
-            print(f"      Fix: {d['fix']}")
+            print(f"      fix: {d['fix']}")
     print("\nPing summary:")
     for row in ping_summary_rows(results):
         c = compact_ping(row)
@@ -1595,6 +2664,8 @@ def full_diagnostic(args, callback=None):
         "bufferbloat": None,
         "download_test": None,
         "connection_test": None,
+        "reliability_test": None,
+        "wellknown_test": None,
         "tools": tools,
         "diagnosis": [],
         "health_score": 0,
@@ -1759,6 +2830,44 @@ def full_diagnostic(args, callback=None):
                 ok = 1 if mp.get("available") else 0
                 callback("mtu_probe", 1, 1, ok, mp.get("mtu", 0), "done" if mp.get("available") else "error")
 
+        if getattr(args, "reliability_test", False):
+            cfg = load_config(getattr(args, "history_dir", "~/.netdiag"))
+            if not args.quiet:
+                print("Reliability test: intermittent connection detector...", flush=True)
+            if callback:
+                callback("reliability", 0, 1, None, None, "running")
+            rel = reliability_test(
+                targets=getattr(args, "reliability_targets", None) or cfg.get("reliability_targets"),
+                samples=getattr(args, "reliability_samples", None) or cfg.get("reliability_samples", 20),
+                duration_s=getattr(args, "reliability_duration", None) or cfg.get("reliability_duration", 0),
+                concurrency=getattr(args, "reliability_concurrency", None) or cfg.get("reliability_concurrency", 8),
+                retries=cfg.get("reliability_retries", 2),
+                timeout_s=cfg.get("reliability_timeout", 5),
+                callback=callback)
+            results["reliability_test"] = rel
+            if callback:
+                ff = rel.get("first_attempt_fail_pct")
+                ok = 1 if (ff is not None and ff < 10) else 0
+                callback("reliability", rel.get("samples_total", 1), max(rel.get("samples_total", 1), 1),
+                         ok, ff, "done" if rel.get("available") else "error")
+
+        if getattr(args, "wellknown_test", False):
+            cfg = load_config(getattr(args, "history_dir", "~/.netdiag"))
+            if not args.quiet:
+                print("Intermittent reproduction: probing ~100 well-known sites (~2.5 min)...", flush=True)
+            if callback:
+                callback("wellknown", 0, 1, None, None, "running")
+            wk = wellknown_sites_test(
+                duration_s=getattr(args, "wellknown_duration", None) or cfg.get("wellknown_duration", 150),
+                concurrency=getattr(args, "wellknown_concurrency", None) or cfg.get("wellknown_concurrency", 12),
+                callback=callback)
+            results["wellknown_test"] = wk
+            if callback:
+                ff = wk.get("first_attempt_fail_pct")
+                ok = 1 if (ff is not None and ff < 10) else 0
+                callback("wellknown", wk.get("samples_total", 1), max(wk.get("samples_total", 1), 1),
+                         ok, ff, "done" if wk.get("available") else "error")
+
     except UserInterrupted as e:
         results["interrupted"] = True
         results["interrupt_reason"] = str(e)
@@ -1768,6 +2877,9 @@ def full_diagnostic(args, callback=None):
         results["interrupt_reason"] = "Interrupted by user"
         print("\nInterrupted by user.", file=sys.stderr)
 
+    # Compute the ICMP/TCP reconciliation once and cache it so diagnose(),
+    # health_score(), the report, and the UI all read the same single source.
+    results["icmp_reconciliation"] = reconcile_icmp(results)
     results["diagnosis"] = diagnose(results)
     results["health_score"] = health_score(results)
     return results
@@ -1795,6 +2907,12 @@ CONFIG_DEFAULTS = {
     "monitor_external_hosts": list(DEFAULT_HOSTS[:2]),
     "monitor_dns_host": DNS_HOSTS[0],
     "monitor_tcp_target": list(TCP_TARGETS[0]),
+    "reliability_targets": list(RELIABILITY_TARGETS),
+    "reliability_samples": 20,
+    "reliability_concurrency": 8,
+    "reliability_retries": 2,
+    "reliability_timeout": 5,
+    "reliability_duration": 0,
     "history_dir": "~/.netdiag",
 }
 
@@ -1825,6 +2943,11 @@ CONFIG_LIMITS = {
     "dns_count": (1, 100),
     "tcp_count": (1, 100),
     "monitor_interval": (0.5, 10),
+    "reliability_samples": (1, 500),
+    "reliability_concurrency": (1, 64),
+    "reliability_retries": (0, 5),
+    "reliability_timeout": (1, 30),
+    "reliability_duration": (0, 600),
 }
 
 
@@ -1867,6 +2990,9 @@ def build_parser():
     parser.add_argument("--no-bufferbloat", action="store_true")
     parser.add_argument("--download-test", action="store_true", help="Download 100 images to measure throughput")
     parser.add_argument("--connection-test", action="store_true", help="HTTP latency + MTU probe")
+    parser.add_argument("--reliability-test", action="store_true", help="Intermittent connection detector (cache-defeating fresh-connection probe)")
+    parser.add_argument("--wellknown-test", action="store_true", help="Reproduce intermittent issues by fetching small images from ~100 well-known sites for ~2.5 min")
+    parser.add_argument("--isp-report", action="store_true", help="Also print the detailed ISP evidence report to the console (always written to isp_report.txt)")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-ping progress output")
     parser.add_argument("--gui", action="store_true", help="Start web GUI at http://localhost:8080")
     parser.add_argument("--daemon", action="store_true", help="Continuous monitoring + web GUI")
@@ -1951,7 +3077,11 @@ def cli_main():
     write_csv(outdir / "ping_samples.csv", flatten_ping(results))
     write_csv(outdir / "ping_summary.csv", ping_summary_rows(results))
     write_report(outdir / "report.txt", results)
+    (outdir / "isp_report.txt").write_text(build_isp_report(results), encoding="utf-8")
     print_console_summary(results, outdir)
+    if getattr(args, "isp_report", False):
+        print("\n" + "=" * 72)
+        print(build_isp_report(results))
 
     save_history(args.history_dir, results)
 
@@ -2191,6 +3321,15 @@ def _diag_args_from_kw(kw):
     a.no_iperf = not kw.get("iperf3", False)
     a.download_test = kw.get("download_test", False)
     a.connection_test = kw.get("connection_test", False)
+    a.reliability_test = kw.get("reliability_test", False)
+    a.reliability_targets = kw.get("reliability_targets") or cfg.get("reliability_targets")
+    a.reliability_samples = int(kw.get("reliability_samples", cfg.get("reliability_samples", 20)))
+    a.reliability_concurrency = int(kw.get("reliability_concurrency", cfg.get("reliability_concurrency", 8)))
+    a.reliability_duration = int(kw.get("reliability_duration", cfg.get("reliability_duration", 0)))
+    a.wellknown_test = kw.get("wellknown_test", False)
+    a.wellknown_duration = int(kw.get("wellknown_duration", cfg.get("wellknown_duration", 150)))
+    a.wellknown_concurrency = int(kw.get("wellknown_concurrency", cfg.get("wellknown_concurrency", 12)))
+    a.isp_report = kw.get("isp_report", False)
     a.outdir = "internet_diagnostics"
     a.history_dir = cfg.get("history_dir", "~/.netdiag")
     return a
@@ -2345,6 +3484,37 @@ TOOLS_MENU = [
          {"name": "Heavy (100 images)", "values": {"count": 100, "timeout": 15}},
      ],
      "run": lambda kw: download_images_test(count=int(kw.get("count", 50)), timeout_s=int(kw.get("timeout", 10)))},
+    {"id": "reliability_test", "name": "Reliability / Intermittent Test", "layer": 7, "layer_name": "Application (L5-7)",
+     "desc": "Detect intermittent connection failures (first-connect-fails-then-retry-works). Makes many fresh, "
+             "cache-defeating HTTPS connections; times DNS/TCP/TLS/first-byte phases; compares IPv4 vs IPv6, "
+             "low vs high concurrency, and hostname vs bare-IP targets to localize the cause.",
+     "docs": "Method: socket + ssl + urllib (stdlib). Defeats caching via unique URLs, no-cache headers, "
+             "Connection: close, fresh sockets, and TLS session-ticket disable. Plan B: urllib total-time.",
+     "params": [
+         {"key": "targets", "label": "Target URLs (comma-separated, blank = defaults)", "type": "text", "default": ",".join(RELIABILITY_TARGETS)},
+         {"key": "samples", "label": "Samples per target", "type": "number", "default": 20, "min": 1, "max": 500},
+         {"key": "duration", "label": "Duration (s, 0 = use sample count)", "type": "number", "default": 0, "min": 0, "max": 600},
+         {"key": "concurrency", "label": "Concurrency (parallel connections)", "type": "number", "default": 8, "min": 1, "max": 64},
+         {"key": "retries", "label": "Retries after a failed first attempt", "type": "number", "default": 2, "min": 0, "max": 5},
+         {"key": "timeout", "label": "Timeout per attempt (s)", "type": "number", "default": 5, "min": 1, "max": 30},
+         {"key": "ipv", "label": "IP mode (0 = both, 4, or 6)", "type": "text", "default": "0"},
+         {"key": "compare_concurrency", "label": "Also run sequential pass (low vs high A/B)", "type": "checkbox", "default": True},
+     ],
+     "presets": [
+         {"name": "Quick", "values": {"samples": 5, "concurrency": 4, "duration": 0, "compare_concurrency": True}},
+         {"name": "Standard", "values": {"samples": 20, "concurrency": 8, "duration": 0, "compare_concurrency": True}},
+         {"name": "Stress (high concurrency)", "values": {"samples": 20, "concurrency": 32, "duration": 0, "compare_concurrency": True}},
+         {"name": "Long-watch (duration)", "values": {"samples": 5, "concurrency": 8, "duration": 60, "compare_concurrency": False}},
+     ],
+     "run": lambda kw: reliability_test(
+         targets=kw.get("targets") or None,
+         samples=int(kw.get("samples", 20) or 20),
+         duration_s=int(kw.get("duration", 0) or 0),
+         concurrency=int(kw.get("concurrency", 8) or 8),
+         retries=int(kw.get("retries", 2) or 0),
+         timeout_s=int(kw.get("timeout", 5) or 5),
+         ipv=int(kw.get("ipv", 0) or 0),
+         compare_concurrency=bool(kw.get("compare_concurrency", True)))},
      {"id": "bufferbloat", "name": "Bufferbloat Test", "layer": 7, "layer_name": "Application (L5-7)",
      "desc": "Run concurrent ping+iPerf3 to measure latency under load. High ratios (>3x) indicate bufferbloat.",
      "docs": "Command: tc -s qdisc + iperf3 (Linux enhanced)  |  Plan B: iperf3 concurrent ping (non-Linux)",
@@ -2521,6 +3691,40 @@ main{padding:20px;max-width:1100px;margin:0 auto}
 .stack-detail{font-size:11px;color:var(--info);margin-top:2px}
 .stack-fix{font-size:12px;margin-top:6px;padding:8px 12px;background:#1e293b;border-radius:4px;border-left:3px solid var(--accent);display:none}
 .stack-layer.expanded .stack-fix{display:block}
+.sect-head{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--info);margin:18px 0 6px}
+.sect-head:first-child{margin-top:0}
+.sect-sub{font-size:11px;color:var(--info);margin:-2px 0 8px;font-weight:400;text-transform:none;letter-spacing:0}
+.finding{border:1px solid var(--border);border-radius:6px;margin:6px 0;cursor:pointer;border-left-width:3px;transition:background .15s}
+.finding:hover{background:#33415533}
+.finding.bad{border-left-color:var(--red)}
+.finding.warning{border-left-color:var(--yellow)}
+.finding.info{border-left-color:var(--info)}
+.finding.clean{border-left-color:var(--green)}
+.finding-head{display:flex;align-items:center;padding:11px 14px;gap:11px}
+.finding-htext{flex:1;min-width:0}
+.finding-title{font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.finding-detail{font-size:11px;color:var(--info);margin-top:3px;line-height:1.5}
+.finding-layer{font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:var(--info);background:var(--bg);border:1px solid var(--border);padding:2px 7px;border-radius:10px;flex-shrink:0}
+.conf-badge{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:8px;background:#38bdf822;color:var(--accent)}
+.conf-badge.medium{background:#eab30822;color:var(--yellow)}
+.conf-badge.low{background:#64748b33;color:var(--info)}
+.finding-body{display:none;padding:0 14px 12px 49px}
+.finding.expanded .finding-body{display:block}
+.fblk{margin-top:10px}
+.fblk .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--info);margin-bottom:4px}
+.fblk.facts .lbl{color:var(--green)}
+.fblk.assume .lbl{color:var(--accent)}
+.fblk.fix .lbl{color:var(--orange)}
+.fblk ul{margin:0;padding-left:16px}
+.fblk li{font-size:12px;line-height:1.6;color:var(--fg)}
+.fblk p{margin:0;font-size:12px;line-height:1.6;color:var(--fg)}
+.fhint{font-size:11px;color:var(--info);padding:6px 0 2px}
+.meas-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+@media(max-width:560px){.meas-grid{grid-template-columns:1fr}}
+.meas-row{display:flex;justify-content:space-between;gap:10px;padding:8px 12px;background:var(--card);font-size:12px}
+.meas-row .mk{color:var(--info)}
+.meas-row .mv{font-family:monospace;text-align:right}
+.meas-row .mv .note{color:var(--accent);font-family:inherit;font-size:10px;display:block}
 .btn{background:var(--accent);color:#000;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
 .btn:hover{opacity:.9}
 .btn:disabled{opacity:.5;cursor:default}
@@ -2729,6 +3933,8 @@ th{color:var(--info);font-weight:500}
 <div class="option-row"><input type="checkbox" id="opt-speedtest" checked><label for="opt-speedtest">Speed test</label></div>
 <div class="option-row"><input type="checkbox" id="opt-download"><label for="opt-download">Download test (100 images)</label></div>
 <div class="option-row"><input type="checkbox" id="opt-connection"><label for="opt-connection">Connection testing (HTTP latency + MTU)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-reliability"><label for="opt-reliability">Reliability test (intermittent / first-connect-fails)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-wellknown"><label for="opt-wellknown">Intermittent reproduction &mdash; 100 well-known sites, ~2.5 min</label></div>
 <div class="option-row"><input type="checkbox" id="opt-trace" checked><label for="opt-trace">Route trace (MTR)</label></div>
 <div class="option-row"><input type="checkbox" id="opt-bufferbloat" checked><label for="opt-bufferbloat">Bufferbloat test</label></div>
 <div class="option-row"><input type="checkbox" id="opt-iperf3"><label for="opt-iperf3">iPerf3 throughput</label></div>
@@ -3531,6 +4737,8 @@ function getOpts(){
     speedtest: document.getElementById('opt-speedtest').checked,
     download_test: document.getElementById('opt-download').checked,
     connection_test: document.getElementById('opt-connection').checked,
+    reliability_test: document.getElementById('opt-reliability').checked,
+    wellknown_test: document.getElementById('opt-wellknown').checked,
     trace: document.getElementById('opt-trace').checked,
     bufferbloat: document.getElementById('opt-bufferbloat').checked,
     iperf3: document.getElementById('opt-iperf3').checked
@@ -3686,7 +4894,7 @@ function loadTools(){
 }
 document.querySelectorAll('#options-panel input').forEach(function(el){el.addEventListener('change',saveOpts);});
 
-function pretty(l){return l.replace(/_/g,' ').replace(/(^\w|\s\w)/g,function(m){return m.toUpperCase();});}
+function pretty(l){if(l==='wellknown')return '100-site reproduction';if(l==='reliability')return 'Reliability';return l.replace(/_/g,' ').replace(/(^\w|\s\w)/g,function(m){return m.toUpperCase();});}
 
 function sev(label,ok,total,rtt){
   if(total==null||total===0)return 'running';
@@ -3698,11 +4906,12 @@ function sev(label,ok,total,rtt){
   if(label==='tcp_sockets')return ok>0?'clean':'warning';
   if(label==='bufferbloat')return (rtt||0)>300?'bad':(rtt>200?'warning':'clean');
   if(label==='mtr')return ok>0?'clean':'warning';
-  if(label==='speedtest')return rtt<1?'bad':(rtt<10?'warning':'clean');
-  if(label==='iperf3')return ok>0?'clean':'warning';
-  if(label==='download_test')return rtt<1?'bad':rtt<5?'warning':'clean';
+  if(label==='speedtest')return rtt>0?(rtt<10?'warning':'clean'):'info';
+  if(label==='iperf3')return rtt>0?'clean':'info';
+  if(label==='download_test')return ok>0?'clean':'warning';
   if(label==='http_latency')return ok>0?'clean':'warning';
   if(label==='mtu_probe')return ok>0?'clean':'warning';
+  if(label==='reliability'||label==='reliability_low'||label==='wellknown'||label==='wellknown_low')return (ok||0)>0?'clean':'info';
   if(loss>=5)return 'bad';
   if(loss>=1)return 'warning';
   if(rtt!=null&&rtt>=300)return 'bad';
@@ -3723,12 +4932,13 @@ function summary(label,ok,total,rtt,st){
   }
   if(label==='tcp_sockets')return ok>0?'Clean':'Retrans: '+rtt+'%';
   if(label==='bufferbloat')return ((rtt||0)/100).toFixed(1)+'x';
-  if(label==='mtr')return ok>0?'Route clean':'Loss detected';
-  if(label==='speedtest')return (rtt||0)+' Mbps';
-  if(label==='iperf3')return (rtt||0)+' Mbps';
-  if(label==='download_test')return (rtt||0)+' Mbps, '+ok+' images';
+  if(label==='mtr')return ok>0?'Route clean':'Mid-route loss (check findings)';
+  if(label==='speedtest')return rtt>0?(rtt+' Mbps'):'Not available';
+  if(label==='iperf3')return rtt>0?(rtt+' Mbps'):'Inconclusive';
+  if(label==='download_test')return ok+' images ok, '+(rtt||0)+' Mbps agg';
   if(label==='http_latency')return ok+'/'+total+' hosts OK';
   if(label==='mtu_probe')return rtt+' MTU';
+  if(label==='reliability'||label==='reliability_low'||label==='wellknown'||label==='wellknown_low')return (ok||0)+'/'+(total||'?')+' trials ok';
   if(total>0){
     let loss=total>0?(1-(ok||0)/total)*100:0;
     return (rtt||'?')+'ms, '+loss.toFixed(1)+'% loss';
@@ -3817,41 +5027,82 @@ function runDiagnostic(){
   startDiagnostic(null,false);
 }
 
+function ndEsc(t){return String(t==null?'':t).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function ndSevRank(s){var m={bad:0,warning:1,info:2,clean:3};return m[s]==null?2:m[s];}
+
+// Single source of truth: the cards below render diagnose()'s output verbatim, so
+// the icon, severity and fix can never disagree (the old per-card recompute caused
+// 'red X + No specific fix needed'). Findings interpret; Measurements are raw.
 function renderStackLayers(container){
   fetch('/api/status').then(function(r){return r.json();}).then(function(s){
     if(!s.results)return;
-    let r=s.results;
-    let layers=[];
-    if(r.wifi&&r.wifi.available){let sev='clean';if(r.wifi.signal_dbm!=null&&r.wifi.signal_dbm<-70)sev='warning';if(r.wifi.signal_dbm!=null&&r.wifi.signal_dbm<-80)sev='bad';
-      layers.push({name:'WiFi',icon:sev,detail:'Signal: '+(r.wifi.signal_dbm!=null?r.wifi.signal_dbm+' dBm':'N/A'),fix:''});}
-    if(r.interface&&r.interface.available){let rx=r.interface.rx||{},tx=r.interface.tx||{},errs=rx.errors+tx.errors+rx.dropped+tx.dropped;
-      let sev=errs>0?'bad':'clean';
-      layers.push({name:'Interface',icon:sev,detail:errs>0?('Errors: '+errs):'Clean',fix:''});}
-    if(r.ethtool&&r.ethtool.available&&r.ethtool.duplex==='Half'){layers.push({name:'Ethernet',icon:'bad',detail:'Half-duplex',fix:'Force full-duplex on both sides.'});}
-    if(r.gateway_ping){let l=r.gateway_ping,sev='clean';if(l.loss_pct>=5)sev='bad';else if(l.loss_pct>=1)sev='warning';else if(l.p95_ms>=50)sev='warning';
-      layers.push({name:'Gateway',icon:sev,detail:'p95: '+l.p95_ms+'ms, loss: '+l.loss_pct+'%',fix:''});}
-    if(r.bufferbloat&&r.bufferbloat.available&&r.bufferbloat.ratio){let sev=r.bufferbloat.ratio>3?'bad':r.bufferbloat.ratio>2?'warning':'clean';
-      layers.push({name:'Bufferbloat',icon:sev,detail:'Ratio: '+r.bufferbloat.ratio.toFixed(1)+'x',fix:''});}
-    if(r.mtr&&r.mtr.hops&&r.mtr.hops.length){let badHop=r.mtr.hops.find(function(h){return h.loss_pct>5;});let sev=badHop?'bad':'clean';
-      layers.push({name:'ISP Route',icon:sev,detail:badHop?('Loss at hop '+badHop.hop):'Clean',fix:''});}
-    if(r.internet_ping){let bad=r.internet_ping.find(function(p){let l=p.loss_pct||0;return l>=1||(p.p95_ms||0)>=150;});
-      layers.push({name:'Internet',icon:bad?'warning':'clean',detail:bad?bad.label+' unstable':'Stable',fix:''});}
-    if(r.dns){let bad=r.dns.find(function(d){return (d.failure_pct||0)>0;});layers.push({name:'DNS',icon:bad?'bad':'clean',detail:bad?bad.host+' fails: '+bad.failure_pct+'%':'Clean',fix:''});}
-    if(r.tcp){let bad=r.tcp.find(function(t){return (t.failure_pct||0)>0||(t.p95_ms||0)>500;});layers.push({name:'TCP',icon:bad?'bad':'clean',detail:bad?bad.host+':'+bad.port+' issues':'Clean',fix:''});}
-    if(r.download_test&&r.download_test.error==null){let mbps=r.download_test.avg_mbps||0;let sev=mbps<1?'bad':mbps<5?'warning':'clean';
-      layers.push({name:'Download',icon:sev,detail:mbps+' Mbps, '+r.download_test.success+'/'+(r.download_test.success+r.download_test.failures)+' images',fix:''});}
-    if(r.connection_test&&r.connection_test.http_latency){let bad=r.connection_test.http_latency.find(function(h){return (h.p95_ms||0)>300;});
-      layers.push({name:'HTTP Latency',icon:bad?'warning':'clean',detail:bad?bad.host+' slow':'OK',fix:''});}
-    if(r.connection_test&&r.connection_test.mtu&&r.connection_test.mtu.available){
-      layers.push({name:'MTU',icon:r.connection_test.mtu.mtu<1400?'warning':'clean',detail:r.connection_test.mtu.mtu+' bytes',fix:''});}
-    container.innerHTML=layers.map(function(l,i){
-      let ico={clean:'O',warning:'!',bad:'X',info:'i'}[l.icon]||'?';
-      return '<div class="stack-layer" onclick="this.classList.toggle(\'expanded\')">'+
-        '<div class="stack-icon '+l.icon+'">'+ico+'</div>'+
-        '<div class="stack-body"><div class="stack-title">'+l.name+'</div><div class="stack-detail">'+l.detail+'</div></div>'+
-        '<div class="stack-fix">'+(l.fix||'No specific fix needed.')+'</div></div>';
-    }).join('');
+    container.innerHTML=ndFindingsHtml(s.results)+ndMeasurementsHtml(s.results);
   });
+}
+
+function ndFindingsHtml(r){
+  var icon={clean:'O',warning:'!',bad:'X',info:'i'};
+  var diag=(r.diagnosis||[]).slice().sort(function(a,b){return ndSevRank(a.severity)-ndSevRank(b.severity);});
+  var html='<div class="sect-head">Findings</div>'+
+    '<div class="sect-sub">Each finding separates what was measured (facts) from what we infer (interpretation). Click to expand.</div>';
+  if(!diag.length)return html+'<div class="fhint">No findings yet.</div>';
+  html+=diag.map(function(d){
+    var sev=d.severity||'info';
+    var conf=d.confidence?'<span class="conf-badge '+ndEsc(d.confidence)+'">'+ndEsc(d.confidence)+' confidence</span>':'';
+    var body='';
+    if(d.facts&&d.facts.length)
+      body+='<div class="fblk facts"><div class="lbl">Measured facts</div><ul>'+d.facts.map(function(f){return '<li>'+ndEsc(f)+'</li>';}).join('')+'</ul></div>';
+    if(d.assumption)
+      body+='<div class="fblk assume"><div class="lbl">Interpretation (what we infer, and why)</div><p>'+ndEsc(d.assumption)+'</p></div>';
+    if(d.fix)
+      body+='<div class="fblk fix"><div class="lbl">What to do</div><p>'+ndEsc(d.fix)+'</p></div>';
+    if(!body)body='<div class="fhint">No further detail for this item.</div>';
+    return '<div class="finding '+sev+'" onclick="this.classList.toggle(\'expanded\')">'+
+      '<div class="finding-head">'+
+        '<div class="stack-icon '+sev+'">'+(icon[sev]||'?')+'</div>'+
+        '<div class="finding-htext"><div class="finding-title">'+ndEsc(d.title)+conf+'</div>'+
+        (d.detail?'<div class="finding-detail">'+ndEsc(d.detail)+'</div>':'')+'</div>'+
+        '<span class="finding-layer">'+ndEsc(d.layer||'')+'</span>'+
+      '</div><div class="finding-body">'+body+'</div></div>';
+  }).join('');
+  return html;
+}
+
+function ndMeasurementsHtml(r){
+  var recon=r.icmp_reconciliation||{};
+  var filtered={};(recon.filtered_hosts||[]).forEach(function(h){filtered[h]=1;});
+  var rows=[];
+  function add(k,v,note){rows.push({k:k,v:v,note:note||''});}
+  if(r.interface&&r.interface.available){var rx=r.interface.rx||{},tx=r.interface.tx||{};
+    add('Interface errors/drops',(rx.errors||0)+(tx.errors||0)+(rx.dropped||0)+(tx.dropped||0));}
+  if(r.wifi&&r.wifi.available&&r.wifi.signal_dbm!=null)add('WiFi signal',r.wifi.signal_dbm+' dBm');
+  if(r.ethtool&&r.ethtool.available&&r.ethtool.duplex)add('Link duplex',r.ethtool.duplex);
+  if(r.gateway_ping)add('Gateway (hop 1)',(r.gateway_ping.loss_pct==null?'?':r.gateway_ping.loss_pct)+'% loss, p95 '+(r.gateway_ping.p95_ms==null?'?':r.gateway_ping.p95_ms)+' ms');
+  (r.internet_ping||[]).forEach(function(p){
+    add('Ping '+p.label,(p.loss_pct==null?'?':p.loss_pct)+'% ICMP loss, p95 '+(p.p95_ms==null?'?':p.p95_ms)+' ms',
+        filtered[p.host]?'ICMP rate-limited by host — not real packet loss':'');});
+  (r.tcp||[]).forEach(function(t){var ok=(t.attempts||0)-(t.failures||0);
+    add('TCP '+t.host+':'+t.port,ok+'/'+(t.attempts||'?')+' connects, p95 '+(t.p95_ms==null?'?':t.p95_ms)+' ms');});
+  (r.dns||[]).forEach(function(d){add('DNS '+d.host,(d.failure_pct||0)+'% fail, p95 '+(d.p95_ms==null?'?':d.p95_ms)+' ms');});
+  if(r.bufferbloat&&r.bufferbloat.available&&r.bufferbloat.ratio!=null)add('Bufferbloat ratio',r.bufferbloat.ratio.toFixed(1)+'x');
+  if(r.mtr&&r.mtr.hops&&r.mtr.hops.length){var last=r.mtr.hops[r.mtr.hops.length-1];
+    add('Route (MTR)',r.mtr.hops.length+' hops, destination loss '+(last.loss_pct||0)+'%');}
+  if(r.download_test&&r.download_test.error==null){var dt=r.download_test;
+    add('Small-image fetch',(dt.success||0)+'/'+((dt.success||0)+(dt.failures||0))+' ok, '+(dt.avg_mbps||0)+' Mbps aggregate');}
+  if(r.connection_test&&r.connection_test.http_latency){var hl=r.connection_test.http_latency;
+    var okc=hl.filter(function(h){return !(h.failures>0);}).length;add('HTTP reachability',okc+'/'+hl.length+' hosts ok');}
+  if(r.connection_test&&r.connection_test.mtu&&r.connection_test.mtu.available)add('Path MTU',r.connection_test.mtu.mtu+' bytes');
+  if(r.speedtest){if(r.speedtest.available&&r.speedtest.download_mbps!=null)add('Speed test',r.speedtest.download_mbps+' Mbps down');else add('Speed test','not available / inconclusive');}
+  if(r.reliability_test&&r.reliability_test.available){var rt=r.reliability_test;
+    add('Reliability probe',(rt.first_attempt_fail_pct==null?'?':rt.first_attempt_fail_pct)+'% first-attempt fail, '+(rt.recovered_on_retry||0)+' recovered on retry');}
+  if(r.wellknown_test&&r.wellknown_test.available){var wt=r.wellknown_test;
+    add('100-site reproduction',(wt.samples_total||0)+' attempts to '+(wt.site_count||'?')+' sites, '+(wt.first_attempt_fail_pct==null?'?':wt.first_attempt_fail_pct)+'% first-attempt fail');}
+  if(!rows.length)return '';
+  return '<div class="sect-head">Measurements</div>'+
+    '<div class="sect-sub">Raw values, no judgement applied. The Findings above interpret these numbers.</div>'+
+    '<div class="meas-grid">'+rows.map(function(x){
+      return '<div class="meas-row"><span class="mk">'+ndEsc(x.k)+'</span><span class="mv">'+ndEsc(x.v)+
+        (x.note?'<span class="note">'+ndEsc(x.note)+'</span>':'')+'</span></div>';}).join('')+'</div>';
 }
 
 function renderResults(results,stackLayers,logDiv){
@@ -4113,8 +5364,9 @@ function loadSessions(){
           '<div class="session-info"><div class="time">'+ts.replace('_',' ')+'</div><div class="summary">Score '+score+'/100 &mdash; '+summary+'</div></div>'+
           '<div class="session-actions">'+
           '<button class="btn btn-secondary" onclick="viewSession(\''+s._file+'\')">View</button>'+
-          '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'json\')">JSON</button>'+
+          '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'isp\')" title="Detailed evidence report to submit to your ISP">ISP report</button>'+
           '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'html\')">HTML</button>'+
+          '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'json\')">JSON</button>'+
           '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'csv\')">CSV</button>'+
           '</div></div>';
       }).join('');
@@ -4359,6 +5611,31 @@ function renderToolResult(toolId,result,el){
       return;
     }
   }
+  if(toolId==='reliability_test'){
+    if(result.available===false){el.innerHTML='<span class="rerr">'+(result.error||'unavailable')+'</span>';return;}
+    var col={clean:'#22c55e',warning:'#eab308',bad:'#ef4444',info:'#38bdf8'};
+    var ic={clean:'✓',warning:'!',bad:'✗',info:'i'};
+    var h='';
+    var vs=result.verdict||[];
+    for(var i=0;i<vs.length;i++){var v=vs[i];var s=v.severity||'info';
+      h+='<div style="padding:8px 10px;margin:4px 0;border-radius:4px;border-left:3px solid '+(col[s]||'#64748b')+';background:var(--card)">';
+      h+='<div style="font-weight:600;font-size:12px">'+(ic[s]||'?')+' '+v.title+'</div>';
+      if(v.detail)h+='<div style="font-size:11px;color:var(--info);margin-top:2px">'+v.detail+'</div>';
+      if(v.fix)h+='<div style="font-size:11px;color:var(--accent);margin-top:2px">Fix: '+v.fix+'</div>';
+      h+='</div>';}
+    h+='<div style="font-size:11px;margin-top:8px"><span class="rkey">Samples</span>: <span class="rval">'+(result.samples_total||0)+'</span> &nbsp; ';
+    h+='<span class="rkey">First-attempt fail</span>: <span class="rval">'+(result.first_attempt_fail_pct==null?'?':result.first_attempt_fail_pct)+'%</span> &nbsp; ';
+    h+='<span class="rkey">Recovered on retry</span>: <span class="rval">'+(result.recovered_on_retry||0)+'</span> &nbsp; ';
+    h+='<span class="rkey">Hard failures</span>: <span class="rval">'+(result.hard_failures||0)+'</span></div>';
+    function tbl(rows){var t='<table style="width:100%;font-size:11px;margin-top:6px;border-collapse:collapse">';for(var r=0;r<rows.length;r++){t+='<tr>';for(var c=0;c<rows[r].length;c++){var tag=r===0?'th':'td';t+='<'+tag+' style="text-align:left;padding:2px 6px;border-bottom:1px solid var(--border)">'+rows[r][c]+'</'+tag+'>';}t+='</tr>';}return t+'</table>';}
+    var fam=result.by_family||{};var famRows=[['Family','Samples','First-fail %','Hard-fail %']];
+    for(var k in fam){famRows.push([k,fam[k].samples,fam[k].first_fail_pct,fam[k].hard_fail_pct]);}
+    if(famRows.length>1)h+='<div class="rkey" style="margin-top:8px">IPv4 vs IPv6</div>'+tbl(famRows);
+    var bc=result.by_concurrency||{};
+    if(bc.low||bc.high){h+='<div class="rkey" style="margin-top:8px">Low vs high concurrency</div>'+tbl([['Mode','First-fail %','Samples'],['sequential',(bc.low?bc.low.first_fail_pct:'-'),(bc.low?bc.low.samples:'-')],['concurrent',(bc.high?bc.high.first_fail_pct:'-'),(bc.high?bc.high.samples:'-')]]);}
+    var bt=result.by_target||[];if(bt.length){var tr=[['Target','IP?','First-fail %','Hard-fail %','TLS p95']];for(var i=0;i<bt.length;i++){var t=bt[i];tr.push([t.host,(t.is_ip?'yes':'no'),t.first_fail_pct,t.hard_fail_pct,(t.tls_p95==null?'-':t.tls_p95)]);}h+='<div class="rkey" style="margin-top:8px">Per target</div>'+tbl(tr);}
+    el.innerHTML=h;return;
+  }
   if(toolId==='health_score_tool'){
     var hs=result.health_score;
     if(hs!=null){
@@ -4601,6 +5878,13 @@ function renderToolResult(toolId,result,el){
         args.no_iperf = not body.get("iperf3", False)
         args.download_test = body.get("download_test", False)
         args.connection_test = body.get("connection_test", False)
+        args.reliability_test = body.get("reliability_test", False)
+        args.wellknown_test = body.get("wellknown_test", False)
+        if body.get("hosts"):
+            hs = body["hosts"]
+            args.hosts = [h.strip() for h in hs.split(",")] if isinstance(hs, str) else list(hs)
+        if body.get("count"):
+            args.count = int(body["count"])
 
         thread = threading.Thread(target=run_diag, args=(args, current_run), daemon=True)
         thread.start()
@@ -4685,16 +5969,42 @@ function renderToolResult(toolId,result,el){
                                 headers={"Content-Disposition": f"attachment; filename={file.replace('.json','.csv')}"})
             return Response(content="No ping data", status_code=404)
 
+        if format == "isp":
+            text = build_isp_report(data)
+            return Response(content=text, media_type="text/plain; charset=utf-8",
+                            headers={"Content-Disposition":
+                                     f"attachment; filename={file.replace('.json','_ISP_report.txt')}"})
+
         if format == "html":
+            import html as _h
+            esc = _h.escape
             html = "<!DOCTYPE html><html><head><meta charset=utf-8><title>NetDiag Report</title>"
-            html += "<style>body{font:14px system-ui;max-width:800px;margin:40px auto;padding:20px;background:#0f172a;color:#e2e8f0}"
-            html += "h1{color:#38bdf8}h2{color:#e2e8f0;margin-top:24px}.card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px;margin:8px 0}"
-            html += ".bad{color:#ef4444}.warning{color:#eab308}.clean{color:#22c55e}pre{background:#0f172a;padding:12px;border-radius:4px;overflow-x:auto}</style></head><body>"
-            html += f"<h1>NetDiag Report</h1><p>{data.get('timestamp','')} | {data.get('platform','')} | Score: {data.get('health_score','?')}/100</p>"
-            html += "<h2>Diagnosis</h2>"
-            for d in data.get("diagnosis", []):
-                html += f"<div class='card'><strong class='{d['severity']}'>[{d['layer']}] {d['title']}</strong><br>{d.get('detail','')}<br><em>{d.get('fix','')}</em></div>"
-            html += "<h2>Ping Summary</h2><pre>" + json.dumps(ping_summary_rows(data), indent=2, ensure_ascii=False) + "</pre>"
+            html += "<style>body{font:14px system-ui;max-width:820px;margin:40px auto;padding:20px;background:#0f172a;color:#e2e8f0;line-height:1.6}"
+            html += "h1{color:#38bdf8}h2{color:#e2e8f0;margin-top:24px;border-bottom:1px solid #334155;padding-bottom:6px}"
+            html += ".card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px;margin:10px 0;border-left:3px solid #334155}"
+            html += ".card.bad{border-left-color:#ef4444}.card.warning{border-left-color:#eab308}.card.info{border-left-color:#64748b}.card.clean{border-left-color:#22c55e}"
+            html += ".bad{color:#ef4444}.warning{color:#eab308}.clean{color:#22c55e}.info{color:#94a3b8}"
+            html += ".lbl{font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:700;margin-top:10px}"
+            html += ".facts .lbl{color:#22c55e}.assume .lbl{color:#38bdf8}.fix .lbl{color:#f97316}"
+            html += "ul{margin:4px 0}.conf{font-size:11px;color:#94a3b8} pre{background:#0f172a;padding:12px;border-radius:4px;overflow-x:auto}</style></head><body>"
+            html += f"<h1>NetDiag Report</h1><p>{esc(str(data.get('timestamp','')))} | {esc(str(data.get('platform','')))} | Score: {esc(str(data.get('health_score','?')))}/100</p>"
+            html += "<p style='color:#94a3b8'>Each finding separates <b>measured facts</b> from <b>interpretation</b>. ICMP ping loss to public resolvers that rate-limit ping is excluded from real-loss findings.</p>"
+            html += "<h2>Findings</h2>"
+            ranked = sorted(data.get("diagnosis", []), key=lambda d: {"bad":0,"warning":1,"info":2,"clean":3}.get(d.get("severity"),2))
+            for d in ranked:
+                sev = d.get("severity", "info")
+                conf = f"<span class='conf'> &middot; confidence: {esc(str(d['confidence']))}</span>" if d.get("confidence") else ""
+                html += f"<div class='card {sev}'><strong class='{sev}'>[{esc(str(d.get('layer','')))}] {esc(str(d.get('title','')))}</strong>{conf}"
+                if d.get("detail"):
+                    html += f"<br>{esc(str(d['detail']))}"
+                if d.get("facts"):
+                    html += "<div class='lbl facts'>Measured facts</div><ul>" + "".join(f"<li>{esc(str(f))}</li>" for f in d["facts"]) + "</ul>"
+                if d.get("assumption"):
+                    html += f"<div class='lbl assume'>Interpretation</div><div>{esc(str(d['assumption']))}</div>"
+                if d.get("fix"):
+                    html += f"<div class='lbl fix'>What to do</div><div>{esc(str(d['fix']))}</div>"
+                html += "</div>"
+            html += "<h2>ISP evidence report (copy/paste into a ticket)</h2><pre>" + esc(build_isp_report(data)) + "</pre>"
             html += "</body></html>"
             return Response(content=html, media_type="text/html",
                             headers={"Content-Disposition": f"attachment; filename={file.replace('.json','.html')}"})
@@ -4827,6 +6137,17 @@ def start_server(args):
         current_run["_lock"] = threading.Lock()
         t = threading.Thread(target=daemon_loop, args=(diag_args, current_run), daemon=True)
         t.start()
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("0.0.0.0", args.port))
+    except OSError:
+        print("Error: port %s is already in use by another process." % args.port, file=sys.stderr)
+        print("Another server may be running there. Start NetDiag on a free port: --port <N>", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        probe.close()
 
     log.info("NetDiag web UI starting at http://localhost:%s", args.port)
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")

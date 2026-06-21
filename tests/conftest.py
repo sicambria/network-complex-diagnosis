@@ -7,7 +7,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 def pytest_configure(config):
     REQ_MARKERS = [
-        f"REQ{i:03d}: Functional requirement {i}" for i in range(1, 29)
+        f"REQ{i:03d}: Functional requirement {i}" for i in range(1, 30)
     ] + [
         f"NFR{i:03d}: Non-functional requirement {i}" for i in range(1, 8)
     ] + [

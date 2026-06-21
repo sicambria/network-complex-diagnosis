@@ -256,6 +256,28 @@ The system shall audit which CLI tools are available on `PATH`:
 - Map missing tools to platform-specific install commands for `--install-missing` hints
 - Pass tool availability into the results dict
 
+### REQ-029: Intermittent Connection Reliability Detection
+
+The system shall detect intermittent connection-establishment failures — the "internet works, but often not; first connection fails then a retry works; some addresses ok, some not; many small files/images trigger it" symptom class — via a stdlib-only probe (`reliability_test`) that:
+
+- Makes many **fresh, cache-defeating** HTTPS connections so caching cannot mask the problem:
+  - a unique cache-busting query string per request,
+  - `Cache-Control: no-cache, no-store, max-age=0` and `Pragma: no-cache` request headers,
+  - `Connection: close` plus a brand-new socket per attempt (no keepalive/pooling),
+  - a fresh TLS context per attempt with session tickets disabled (`OP_NO_TICKET`) so TLS resumption cannot hide intermittent handshake failures,
+  - rotation through the resolved A/AAAA addresses (connecting to a specific IP while still sending the correct SNI via `server_hostname`). The OS resolver cache cannot be fully bypassed in stdlib; this is mitigated by also testing bare-IP targets.
+- Times each connection **phase** (DNS → TCP connect → TLS handshake → first byte) and records **which phase the first attempt failed in**.
+- Tracks **first-attempt** outcome separately from the **eventual** (post-retry) outcome, reporting `first_attempt_fail_pct`, `recovered_on_retry`, and `hard_failures`.
+- Tests **IPv4 and IPv6 separately** (`by_family`) to surface broken-IPv6 / happy-eyeballs fallback.
+- Compares **low vs high concurrency** (`by_concurrency`) to reproduce router NAT/conntrack-table exhaustion and rate-limiting (the many-small-files trigger).
+- Breaks results down **per target** (`by_target`), including hostname vs bare-IP, to isolate DNS.
+- Synthesizes a **localized verdict** (severity, title, detail, fix) rather than a raw dump, surfaced into the diagnosis list.
+- Exposes configurable sample count, duration (time-bounded mode), concurrency, retries, timeout, IP mode, and target list via CLI (`--reliability-test`), the GUI config (`reliability_*` keys), the Tools tab, and a Troubleshoot checkbox.
+- Falls back to a `urllib` total-time attempt (no phase breakdown) if the manual socket/ssl stack errors (graceful degradation).
+- Does not alter the REQ-018 health score (stand-alone verdict).
+
+**Known limitations:** The probe is deliberately scoped to connection *establishment* — an attempt that returns any HTTP response (including 4xx/5xx or a captive-portal redirect) counts as a success; HTTP status codes are not inspected. The OS DNS resolver cache cannot be fully bypassed from stdlib; this is mitigated by testing bare-IP targets alongside hostname targets.
+
 ---
 
 ## 2. Non-Functional Requirements

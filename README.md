@@ -70,6 +70,7 @@ python3 netdiag.py --gui
 | Speedtest (Ookla) | Yes | Yes |
 | iPerf3 throughput | Yes | Yes |
 | Bufferbloat detection (Linux enhanced) | Yes | Yes |
+| Intermittent connection detector (cache-defeating, first-vs-retry, IPv4/IPv6, concurrency A/B) | Yes | Yes |
 | 5-layer diagnosis engine | Yes | Yes |
 | Health score 0–100 | Yes | Yes |
 | JSON/CSV/HTML export | Yes | Yes |
@@ -115,6 +116,7 @@ Platform scoring: Linux 93/100, macOS 82/100, Windows 74/100
 --no-bufferbloat        Skip bufferbloat test
 --download-test         Download 100 images to measure throughput
 --connection-test       HTTP latency + MTU probe
+--reliability-test      Intermittent connection detector (cache-defeating fresh-connection probe)
 --gui                   Start web UI at http://localhost:8080
 --daemon                Continuous monitoring + web UI
 --port PORT             Web server port (default: 8080)

@@ -4,6 +4,9 @@
 PYTHON := python3
 SCRIPT := netdiag.py
 VENV := .venv
+# GUI/daemon need fastapi+uvicorn. On PEP-668 (externally-managed) systems a
+# system-wide pip install is blocked, so GUI mode runs from the venv python.
+GUIPY := $(VENV)/bin/python
 HISTDIR := $(HOME)/.netdiag
 
 all: install
@@ -33,12 +36,11 @@ else ifeq ($(shell uname -s),Darwin)
 endif
 
 install-gui:
-	@echo "[install-gui] Installing Python deps for GUI..."
-	$(PYTHON) -c "import fastapi" 2>/dev/null || \
-		$(PYTHON) -m pip install --break-system-packages fastapi uvicorn 2>/dev/null || \
-		$(PYTHON) -m pip install --user fastapi uvicorn 2>/dev/null || \
-		$(PYTHON) -m pip install fastapi uvicorn 2>/dev/null || \
-		echo "  Could not install fastapi/uvicorn. Run: $(PYTHON) -m pip install fastapi uvicorn"
+	@echo "[install-gui] Installing GUI deps into venv ($(VENV))..."
+	test -x $(GUIPY) || $(PYTHON) -m venv $(VENV)
+	$(GUIPY) -m pip install --quiet --upgrade pip
+	$(GUIPY) -m pip install --quiet fastapi uvicorn
+	@$(GUIPY) -c "import fastapi, uvicorn" && echo "  GUI deps ready in $(VENV)"
 
 desktop-install:
 	@echo "[desktop] Installing start menu and desktop icon..."
@@ -49,7 +51,7 @@ desktop-install:
 
 venv:
 	$(PYTHON) -m venv $(VENV)
-	. $(VENV)/bin/activate && pip install --quiet fastapi uvicorn pytest
+	. $(VENV)/bin/activate && pip install --quiet fastapi uvicorn pytest httpx
 	@echo "Virtual env ready: source $(VENV)/bin/activate"
 
 # -- Development ----------------------------------------------------------------
@@ -63,11 +65,11 @@ lint:
 run:
 	$(PYTHON) $(SCRIPT)
 
-gui:
-	$(PYTHON) $(SCRIPT) --gui
+gui: install-gui
+	$(GUIPY) $(SCRIPT) --gui
 
-daemon:
-	$(PYTHON) $(SCRIPT) --daemon
+daemon: install-gui
+	$(GUIPY) $(SCRIPT) --daemon
 
 clean:
 	rm -rf internet_diagnostics/ output/ __pycache__/ .pytest_cache/

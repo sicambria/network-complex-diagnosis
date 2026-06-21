@@ -108,6 +108,49 @@ class TestDiagnose:
         assert any(d["layer"] == "internet" for d in diag)
         assert not any(d["layer"] == "meta" and "both" in d["title"].lower() for d in diag)
 
+    def test_icmp_loss_contradicted_by_tcp_is_rate_limiting(self):
+        # The reported scenario: 95% ICMP "loss" to 1.1.1.1/8.8.8.8 while TCP to the
+        # same hosts connects 10/10. Must be reported as ICMP rate-limiting (info),
+        # NOT packet loss (bad), and must not tank the health score.
+        results = _make_results({
+            "interface": {"available": True, "rx": {"errors": 0, "dropped": 0}, "tx": {"errors": 0, "dropped": 0}},
+            "wifi": {"available": True, "signal_dbm": -60},
+            "bufferbloat": {"available": True, "ratio": 1.1},
+            "gateway_ping": {"loss_pct": 0, "p95_ms": 14, "jitter_ms": 3},
+            "internet_ping": [
+                {"label": "1.1.1.1", "host": "1.1.1.1", "loss_pct": 95, "p95_ms": 183, "jitter_ms": 20},
+                {"label": "8.8.8.8", "host": "8.8.8.8", "loss_pct": 95, "p95_ms": 183, "jitter_ms": 20},
+            ],
+            "tcp": [
+                {"host": "1.1.1.1", "port": 443, "attempts": 10, "failures": 0, "failure_pct": 0, "p95_ms": 102},
+                {"host": "8.8.8.8", "port": 443, "attempts": 10, "failures": 0, "failure_pct": 0, "p95_ms": 102},
+            ],
+            "dns": [{"host": "google.com", "failure_pct": 0, "p95_ms": 1}],
+        })
+        diag = diagnose(results)
+        icmp = [d for d in diag if d["layer"] == "internet" and "rate-limit" in d["title"].lower()]
+        assert icmp, "expected an ICMP rate-limiting finding"
+        assert icmp[0]["severity"] == "info"
+        assert icmp[0].get("confidence") == "high"
+        # No 'bad' packet-loss finding for these hosts.
+        assert not any(d["severity"] == "bad" and "1.1.1.1" in d.get("detail", "") for d in diag)
+        # Health score must not be dragged down by the phantom loss (without the
+        # reconciliation this same input scores ~40).
+        assert health_score(results) >= 85
+
+    def test_icmp_loss_without_corroboration_stays_real(self):
+        # If nothing proves the path works (no TCP/DNS/HTTP), high ICMP loss is
+        # treated as genuine — we do not hand-wave it away.
+        results = _make_results({
+            "gateway_ping": {"loss_pct": 0, "p95_ms": 10, "jitter_ms": 5},
+            "internet_ping": [
+                {"label": "9.9.9.9", "host": "9.9.9.9", "loss_pct": 95, "p95_ms": 200, "jitter_ms": 20},
+            ],
+        })
+        diag = diagnose(results)
+        assert not any(d["layer"] == "internet" and "rate-limit" in d["title"].lower() for d in diag)
+        assert any(d["layer"] == "internet" and d["severity"] in ("bad", "warning") for d in diag)
+
     def test_internet_and_gateway_both_bad(self):
         results = _make_results({
             "gateway_ping": {"loss_pct": 10, "p95_ms": 100, "jitter_ms": 20},
@@ -119,16 +162,20 @@ class TestDiagnose:
         assert any(d["layer"] == "meta" and "both" in d["title"].lower() for d in diag)
 
     def test_mtr_first_hop_loss(self):
+        # Loss that begins at hop 1 AND persists to the destination is real
+        # first-hop (modem/uplink) loss.
         results = _make_results({
             "mtr": {"tool": "mtr", "host": "1.1.1.1", "hops": [
                 {"hop": 1, "loss_pct": 10, "avg_ms": 5},
-                {"hop": 2, "loss_pct": 0, "avg_ms": 10},
+                {"hop": 2, "loss_pct": 12, "avg_ms": 10},
             ]},
         })
         diag = diagnose(results)
-        assert any(d["layer"] == "isp" and "first hops" in d["title"].lower() for d in diag)
+        assert any(d["layer"] == "isp" and d["severity"] == "bad"
+                   and "first hops" in d["title"].lower() for d in diag)
 
     def test_mtr_isp_hop_loss(self):
+        # Loss that begins at hop 3 and reaches the destination is real ISP loss.
         results = _make_results({
             "mtr": {"tool": "mtr", "host": "1.1.1.1", "hops": [
                 {"hop": 1, "loss_pct": 0, "avg_ms": 5},
@@ -137,7 +184,21 @@ class TestDiagnose:
             ]},
         })
         diag = diagnose(results)
-        assert any(d["layer"] == "isp" and "ISP hops" in d["title"] for d in diag)
+        assert any(d["layer"] == "isp" and d["severity"] == "bad" for d in diag)
+
+    def test_mtr_midhop_loss_clears_is_rate_limiting(self):
+        # Loss at an intermediate hop that CLEARS by the destination is that router
+        # rate-limiting its own ICMP — info, never a 'bad' ISP packet-loss finding.
+        results = _make_results({
+            "mtr": {"tool": "mtr", "host": "1.1.1.1", "hops": [
+                {"hop": 1, "loss_pct": 30, "avg_ms": 5},
+                {"hop": 2, "loss_pct": 0, "avg_ms": 10},
+                {"hop": 3, "loss_pct": 0, "avg_ms": 20},
+            ]},
+        })
+        diag = diagnose(results)
+        assert any(d["layer"] == "isp" and d["severity"] == "info" for d in diag)
+        assert not any(d["layer"] == "isp" and d["severity"] == "bad" for d in diag)
 
     def test_bufferbloat_severe(self):
         results = _make_results({

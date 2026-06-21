@@ -36,6 +36,40 @@ main{padding:20px;max-width:1100px;margin:0 auto}
 .stack-detail{font-size:11px;color:var(--info);margin-top:2px}
 .stack-fix{font-size:12px;margin-top:6px;padding:8px 12px;background:#1e293b;border-radius:4px;border-left:3px solid var(--accent);display:none}
 .stack-layer.expanded .stack-fix{display:block}
+.sect-head{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--info);margin:18px 0 6px}
+.sect-head:first-child{margin-top:0}
+.sect-sub{font-size:11px;color:var(--info);margin:-2px 0 8px;font-weight:400;text-transform:none;letter-spacing:0}
+.finding{border:1px solid var(--border);border-radius:6px;margin:6px 0;cursor:pointer;border-left-width:3px;transition:background .15s}
+.finding:hover{background:#33415533}
+.finding.bad{border-left-color:var(--red)}
+.finding.warning{border-left-color:var(--yellow)}
+.finding.info{border-left-color:var(--info)}
+.finding.clean{border-left-color:var(--green)}
+.finding-head{display:flex;align-items:center;padding:11px 14px;gap:11px}
+.finding-htext{flex:1;min-width:0}
+.finding-title{font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.finding-detail{font-size:11px;color:var(--info);margin-top:3px;line-height:1.5}
+.finding-layer{font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:var(--info);background:var(--bg);border:1px solid var(--border);padding:2px 7px;border-radius:10px;flex-shrink:0}
+.conf-badge{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:8px;background:#38bdf822;color:var(--accent)}
+.conf-badge.medium{background:#eab30822;color:var(--yellow)}
+.conf-badge.low{background:#64748b33;color:var(--info)}
+.finding-body{display:none;padding:0 14px 12px 49px}
+.finding.expanded .finding-body{display:block}
+.fblk{margin-top:10px}
+.fblk .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--info);margin-bottom:4px}
+.fblk.facts .lbl{color:var(--green)}
+.fblk.assume .lbl{color:var(--accent)}
+.fblk.fix .lbl{color:var(--orange)}
+.fblk ul{margin:0;padding-left:16px}
+.fblk li{font-size:12px;line-height:1.6;color:var(--fg)}
+.fblk p{margin:0;font-size:12px;line-height:1.6;color:var(--fg)}
+.fhint{font-size:11px;color:var(--info);padding:6px 0 2px}
+.meas-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+@media(max-width:560px){.meas-grid{grid-template-columns:1fr}}
+.meas-row{display:flex;justify-content:space-between;gap:10px;padding:8px 12px;background:var(--card);font-size:12px}
+.meas-row .mk{color:var(--info)}
+.meas-row .mv{font-family:monospace;text-align:right}
+.meas-row .mv .note{color:var(--accent);font-family:inherit;font-size:10px;display:block}
 .btn{background:var(--accent);color:#000;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
 .btn:hover{opacity:.9}
 .btn:disabled{opacity:.5;cursor:default}
@@ -244,6 +278,8 @@ th{color:var(--info);font-weight:500}
 <div class="option-row"><input type="checkbox" id="opt-speedtest" checked><label for="opt-speedtest">Speed test</label></div>
 <div class="option-row"><input type="checkbox" id="opt-download"><label for="opt-download">Download test (100 images)</label></div>
 <div class="option-row"><input type="checkbox" id="opt-connection"><label for="opt-connection">Connection testing (HTTP latency + MTU)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-reliability"><label for="opt-reliability">Reliability test (intermittent / first-connect-fails)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-wellknown"><label for="opt-wellknown">Intermittent reproduction &mdash; 100 well-known sites, ~2.5 min</label></div>
 <div class="option-row"><input type="checkbox" id="opt-trace" checked><label for="opt-trace">Route trace (MTR)</label></div>
 <div class="option-row"><input type="checkbox" id="opt-bufferbloat" checked><label for="opt-bufferbloat">Bufferbloat test</label></div>
 <div class="option-row"><input type="checkbox" id="opt-iperf3"><label for="opt-iperf3">iPerf3 throughput</label></div>
@@ -1046,6 +1082,8 @@ function getOpts(){
     speedtest: document.getElementById('opt-speedtest').checked,
     download_test: document.getElementById('opt-download').checked,
     connection_test: document.getElementById('opt-connection').checked,
+    reliability_test: document.getElementById('opt-reliability').checked,
+    wellknown_test: document.getElementById('opt-wellknown').checked,
     trace: document.getElementById('opt-trace').checked,
     bufferbloat: document.getElementById('opt-bufferbloat').checked,
     iperf3: document.getElementById('opt-iperf3').checked
@@ -1201,7 +1239,7 @@ function loadTools(){
 }
 document.querySelectorAll('#options-panel input').forEach(function(el){el.addEventListener('change',saveOpts);});
 
-function pretty(l){return l.replace(/_/g,' ').replace(/(^\w|\s\w)/g,function(m){return m.toUpperCase();});}
+function pretty(l){if(l==='wellknown')return '100-site reproduction';if(l==='reliability')return 'Reliability';return l.replace(/_/g,' ').replace(/(^\w|\s\w)/g,function(m){return m.toUpperCase();});}
 
 function sev(label,ok,total,rtt){
   if(total==null||total===0)return 'running';
@@ -1213,11 +1251,12 @@ function sev(label,ok,total,rtt){
   if(label==='tcp_sockets')return ok>0?'clean':'warning';
   if(label==='bufferbloat')return (rtt||0)>300?'bad':(rtt>200?'warning':'clean');
   if(label==='mtr')return ok>0?'clean':'warning';
-  if(label==='speedtest')return rtt<1?'bad':(rtt<10?'warning':'clean');
-  if(label==='iperf3')return ok>0?'clean':'warning';
-  if(label==='download_test')return rtt<1?'bad':rtt<5?'warning':'clean';
+  if(label==='speedtest')return rtt>0?(rtt<10?'warning':'clean'):'info';
+  if(label==='iperf3')return rtt>0?'clean':'info';
+  if(label==='download_test')return ok>0?'clean':'warning';
   if(label==='http_latency')return ok>0?'clean':'warning';
   if(label==='mtu_probe')return ok>0?'clean':'warning';
+  if(label==='reliability'||label==='reliability_low'||label==='wellknown'||label==='wellknown_low')return (ok||0)>0?'clean':'info';
   if(loss>=5)return 'bad';
   if(loss>=1)return 'warning';
   if(rtt!=null&&rtt>=300)return 'bad';
@@ -1238,12 +1277,13 @@ function summary(label,ok,total,rtt,st){
   }
   if(label==='tcp_sockets')return ok>0?'Clean':'Retrans: '+rtt+'%';
   if(label==='bufferbloat')return ((rtt||0)/100).toFixed(1)+'x';
-  if(label==='mtr')return ok>0?'Route clean':'Loss detected';
-  if(label==='speedtest')return (rtt||0)+' Mbps';
-  if(label==='iperf3')return (rtt||0)+' Mbps';
-  if(label==='download_test')return (rtt||0)+' Mbps, '+ok+' images';
+  if(label==='mtr')return ok>0?'Route clean':'Mid-route loss (check findings)';
+  if(label==='speedtest')return rtt>0?(rtt+' Mbps'):'Not available';
+  if(label==='iperf3')return rtt>0?(rtt+' Mbps'):'Inconclusive';
+  if(label==='download_test')return ok+' images ok, '+(rtt||0)+' Mbps agg';
   if(label==='http_latency')return ok+'/'+total+' hosts OK';
   if(label==='mtu_probe')return rtt+' MTU';
+  if(label==='reliability'||label==='reliability_low'||label==='wellknown'||label==='wellknown_low')return (ok||0)+'/'+(total||'?')+' trials ok';
   if(total>0){
     let loss=total>0?(1-(ok||0)/total)*100:0;
     return (rtt||'?')+'ms, '+loss.toFixed(1)+'% loss';
@@ -1332,41 +1372,82 @@ function runDiagnostic(){
   startDiagnostic(null,false);
 }
 
+function ndEsc(t){return String(t==null?'':t).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function ndSevRank(s){var m={bad:0,warning:1,info:2,clean:3};return m[s]==null?2:m[s];}
+
+// Single source of truth: the cards below render diagnose()'s output verbatim, so
+// the icon, severity and fix can never disagree (the old per-card recompute caused
+// 'red X + No specific fix needed'). Findings interpret; Measurements are raw.
 function renderStackLayers(container){
   fetch('/api/status').then(function(r){return r.json();}).then(function(s){
     if(!s.results)return;
-    let r=s.results;
-    let layers=[];
-    if(r.wifi&&r.wifi.available){let sev='clean';if(r.wifi.signal_dbm!=null&&r.wifi.signal_dbm<-70)sev='warning';if(r.wifi.signal_dbm!=null&&r.wifi.signal_dbm<-80)sev='bad';
-      layers.push({name:'WiFi',icon:sev,detail:'Signal: '+(r.wifi.signal_dbm!=null?r.wifi.signal_dbm+' dBm':'N/A'),fix:''});}
-    if(r.interface&&r.interface.available){let rx=r.interface.rx||{},tx=r.interface.tx||{},errs=rx.errors+tx.errors+rx.dropped+tx.dropped;
-      let sev=errs>0?'bad':'clean';
-      layers.push({name:'Interface',icon:sev,detail:errs>0?('Errors: '+errs):'Clean',fix:''});}
-    if(r.ethtool&&r.ethtool.available&&r.ethtool.duplex==='Half'){layers.push({name:'Ethernet',icon:'bad',detail:'Half-duplex',fix:'Force full-duplex on both sides.'});}
-    if(r.gateway_ping){let l=r.gateway_ping,sev='clean';if(l.loss_pct>=5)sev='bad';else if(l.loss_pct>=1)sev='warning';else if(l.p95_ms>=50)sev='warning';
-      layers.push({name:'Gateway',icon:sev,detail:'p95: '+l.p95_ms+'ms, loss: '+l.loss_pct+'%',fix:''});}
-    if(r.bufferbloat&&r.bufferbloat.available&&r.bufferbloat.ratio){let sev=r.bufferbloat.ratio>3?'bad':r.bufferbloat.ratio>2?'warning':'clean';
-      layers.push({name:'Bufferbloat',icon:sev,detail:'Ratio: '+r.bufferbloat.ratio.toFixed(1)+'x',fix:''});}
-    if(r.mtr&&r.mtr.hops&&r.mtr.hops.length){let badHop=r.mtr.hops.find(function(h){return h.loss_pct>5;});let sev=badHop?'bad':'clean';
-      layers.push({name:'ISP Route',icon:sev,detail:badHop?('Loss at hop '+badHop.hop):'Clean',fix:''});}
-    if(r.internet_ping){let bad=r.internet_ping.find(function(p){let l=p.loss_pct||0;return l>=1||(p.p95_ms||0)>=150;});
-      layers.push({name:'Internet',icon:bad?'warning':'clean',detail:bad?bad.label+' unstable':'Stable',fix:''});}
-    if(r.dns){let bad=r.dns.find(function(d){return (d.failure_pct||0)>0;});layers.push({name:'DNS',icon:bad?'bad':'clean',detail:bad?bad.host+' fails: '+bad.failure_pct+'%':'Clean',fix:''});}
-    if(r.tcp){let bad=r.tcp.find(function(t){return (t.failure_pct||0)>0||(t.p95_ms||0)>500;});layers.push({name:'TCP',icon:bad?'bad':'clean',detail:bad?bad.host+':'+bad.port+' issues':'Clean',fix:''});}
-    if(r.download_test&&r.download_test.error==null){let mbps=r.download_test.avg_mbps||0;let sev=mbps<1?'bad':mbps<5?'warning':'clean';
-      layers.push({name:'Download',icon:sev,detail:mbps+' Mbps, '+r.download_test.success+'/'+(r.download_test.success+r.download_test.failures)+' images',fix:''});}
-    if(r.connection_test&&r.connection_test.http_latency){let bad=r.connection_test.http_latency.find(function(h){return (h.p95_ms||0)>300;});
-      layers.push({name:'HTTP Latency',icon:bad?'warning':'clean',detail:bad?bad.host+' slow':'OK',fix:''});}
-    if(r.connection_test&&r.connection_test.mtu&&r.connection_test.mtu.available){
-      layers.push({name:'MTU',icon:r.connection_test.mtu.mtu<1400?'warning':'clean',detail:r.connection_test.mtu.mtu+' bytes',fix:''});}
-    container.innerHTML=layers.map(function(l,i){
-      let ico={clean:'O',warning:'!',bad:'X',info:'i'}[l.icon]||'?';
-      return '<div class="stack-layer" onclick="this.classList.toggle(\'expanded\')">'+
-        '<div class="stack-icon '+l.icon+'">'+ico+'</div>'+
-        '<div class="stack-body"><div class="stack-title">'+l.name+'</div><div class="stack-detail">'+l.detail+'</div></div>'+
-        '<div class="stack-fix">'+(l.fix||'No specific fix needed.')+'</div></div>';
-    }).join('');
+    container.innerHTML=ndFindingsHtml(s.results)+ndMeasurementsHtml(s.results);
   });
+}
+
+function ndFindingsHtml(r){
+  var icon={clean:'O',warning:'!',bad:'X',info:'i'};
+  var diag=(r.diagnosis||[]).slice().sort(function(a,b){return ndSevRank(a.severity)-ndSevRank(b.severity);});
+  var html='<div class="sect-head">Findings</div>'+
+    '<div class="sect-sub">Each finding separates what was measured (facts) from what we infer (interpretation). Click to expand.</div>';
+  if(!diag.length)return html+'<div class="fhint">No findings yet.</div>';
+  html+=diag.map(function(d){
+    var sev=d.severity||'info';
+    var conf=d.confidence?'<span class="conf-badge '+ndEsc(d.confidence)+'">'+ndEsc(d.confidence)+' confidence</span>':'';
+    var body='';
+    if(d.facts&&d.facts.length)
+      body+='<div class="fblk facts"><div class="lbl">Measured facts</div><ul>'+d.facts.map(function(f){return '<li>'+ndEsc(f)+'</li>';}).join('')+'</ul></div>';
+    if(d.assumption)
+      body+='<div class="fblk assume"><div class="lbl">Interpretation (what we infer, and why)</div><p>'+ndEsc(d.assumption)+'</p></div>';
+    if(d.fix)
+      body+='<div class="fblk fix"><div class="lbl">What to do</div><p>'+ndEsc(d.fix)+'</p></div>';
+    if(!body)body='<div class="fhint">No further detail for this item.</div>';
+    return '<div class="finding '+sev+'" onclick="this.classList.toggle(\'expanded\')">'+
+      '<div class="finding-head">'+
+        '<div class="stack-icon '+sev+'">'+(icon[sev]||'?')+'</div>'+
+        '<div class="finding-htext"><div class="finding-title">'+ndEsc(d.title)+conf+'</div>'+
+        (d.detail?'<div class="finding-detail">'+ndEsc(d.detail)+'</div>':'')+'</div>'+
+        '<span class="finding-layer">'+ndEsc(d.layer||'')+'</span>'+
+      '</div><div class="finding-body">'+body+'</div></div>';
+  }).join('');
+  return html;
+}
+
+function ndMeasurementsHtml(r){
+  var recon=r.icmp_reconciliation||{};
+  var filtered={};(recon.filtered_hosts||[]).forEach(function(h){filtered[h]=1;});
+  var rows=[];
+  function add(k,v,note){rows.push({k:k,v:v,note:note||''});}
+  if(r.interface&&r.interface.available){var rx=r.interface.rx||{},tx=r.interface.tx||{};
+    add('Interface errors/drops',(rx.errors||0)+(tx.errors||0)+(rx.dropped||0)+(tx.dropped||0));}
+  if(r.wifi&&r.wifi.available&&r.wifi.signal_dbm!=null)add('WiFi signal',r.wifi.signal_dbm+' dBm');
+  if(r.ethtool&&r.ethtool.available&&r.ethtool.duplex)add('Link duplex',r.ethtool.duplex);
+  if(r.gateway_ping)add('Gateway (hop 1)',(r.gateway_ping.loss_pct==null?'?':r.gateway_ping.loss_pct)+'% loss, p95 '+(r.gateway_ping.p95_ms==null?'?':r.gateway_ping.p95_ms)+' ms');
+  (r.internet_ping||[]).forEach(function(p){
+    add('Ping '+p.label,(p.loss_pct==null?'?':p.loss_pct)+'% ICMP loss, p95 '+(p.p95_ms==null?'?':p.p95_ms)+' ms',
+        filtered[p.host]?'ICMP rate-limited by host — not real packet loss':'');});
+  (r.tcp||[]).forEach(function(t){var ok=(t.attempts||0)-(t.failures||0);
+    add('TCP '+t.host+':'+t.port,ok+'/'+(t.attempts||'?')+' connects, p95 '+(t.p95_ms==null?'?':t.p95_ms)+' ms');});
+  (r.dns||[]).forEach(function(d){add('DNS '+d.host,(d.failure_pct||0)+'% fail, p95 '+(d.p95_ms==null?'?':d.p95_ms)+' ms');});
+  if(r.bufferbloat&&r.bufferbloat.available&&r.bufferbloat.ratio!=null)add('Bufferbloat ratio',r.bufferbloat.ratio.toFixed(1)+'x');
+  if(r.mtr&&r.mtr.hops&&r.mtr.hops.length){var last=r.mtr.hops[r.mtr.hops.length-1];
+    add('Route (MTR)',r.mtr.hops.length+' hops, destination loss '+(last.loss_pct||0)+'%');}
+  if(r.download_test&&r.download_test.error==null){var dt=r.download_test;
+    add('Small-image fetch',(dt.success||0)+'/'+((dt.success||0)+(dt.failures||0))+' ok, '+(dt.avg_mbps||0)+' Mbps aggregate');}
+  if(r.connection_test&&r.connection_test.http_latency){var hl=r.connection_test.http_latency;
+    var okc=hl.filter(function(h){return !(h.failures>0);}).length;add('HTTP reachability',okc+'/'+hl.length+' hosts ok');}
+  if(r.connection_test&&r.connection_test.mtu&&r.connection_test.mtu.available)add('Path MTU',r.connection_test.mtu.mtu+' bytes');
+  if(r.speedtest){if(r.speedtest.available&&r.speedtest.download_mbps!=null)add('Speed test',r.speedtest.download_mbps+' Mbps down');else add('Speed test','not available / inconclusive');}
+  if(r.reliability_test&&r.reliability_test.available){var rt=r.reliability_test;
+    add('Reliability probe',(rt.first_attempt_fail_pct==null?'?':rt.first_attempt_fail_pct)+'% first-attempt fail, '+(rt.recovered_on_retry||0)+' recovered on retry');}
+  if(r.wellknown_test&&r.wellknown_test.available){var wt=r.wellknown_test;
+    add('100-site reproduction',(wt.samples_total||0)+' attempts to '+(wt.site_count||'?')+' sites, '+(wt.first_attempt_fail_pct==null?'?':wt.first_attempt_fail_pct)+'% first-attempt fail');}
+  if(!rows.length)return '';
+  return '<div class="sect-head">Measurements</div>'+
+    '<div class="sect-sub">Raw values, no judgement applied. The Findings above interpret these numbers.</div>'+
+    '<div class="meas-grid">'+rows.map(function(x){
+      return '<div class="meas-row"><span class="mk">'+ndEsc(x.k)+'</span><span class="mv">'+ndEsc(x.v)+
+        (x.note?'<span class="note">'+ndEsc(x.note)+'</span>':'')+'</span></div>';}).join('')+'</div>';
 }
 
 function renderResults(results,stackLayers,logDiv){
@@ -1628,8 +1709,9 @@ function loadSessions(){
           '<div class="session-info"><div class="time">'+ts.replace('_',' ')+'</div><div class="summary">Score '+score+'/100 &mdash; '+summary+'</div></div>'+
           '<div class="session-actions">'+
           '<button class="btn btn-secondary" onclick="viewSession(\''+s._file+'\')">View</button>'+
-          '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'json\')">JSON</button>'+
+          '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'isp\')" title="Detailed evidence report to submit to your ISP">ISP report</button>'+
           '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'html\')">HTML</button>'+
+          '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'json\')">JSON</button>'+
           '<button class="btn btn-secondary" onclick="exportReport(\''+s._file+'\',\'csv\')">CSV</button>'+
           '</div></div>';
       }).join('');
@@ -1873,6 +1955,31 @@ function renderToolResult(toolId,result,el){
       el.innerHTML=dhtml||'<span class="rval">No diagnoses</span>';
       return;
     }
+  }
+  if(toolId==='reliability_test'){
+    if(result.available===false){el.innerHTML='<span class="rerr">'+(result.error||'unavailable')+'</span>';return;}
+    var col={clean:'#22c55e',warning:'#eab308',bad:'#ef4444',info:'#38bdf8'};
+    var ic={clean:'✓',warning:'!',bad:'✗',info:'i'};
+    var h='';
+    var vs=result.verdict||[];
+    for(var i=0;i<vs.length;i++){var v=vs[i];var s=v.severity||'info';
+      h+='<div style="padding:8px 10px;margin:4px 0;border-radius:4px;border-left:3px solid '+(col[s]||'#64748b')+';background:var(--card)">';
+      h+='<div style="font-weight:600;font-size:12px">'+(ic[s]||'?')+' '+v.title+'</div>';
+      if(v.detail)h+='<div style="font-size:11px;color:var(--info);margin-top:2px">'+v.detail+'</div>';
+      if(v.fix)h+='<div style="font-size:11px;color:var(--accent);margin-top:2px">Fix: '+v.fix+'</div>';
+      h+='</div>';}
+    h+='<div style="font-size:11px;margin-top:8px"><span class="rkey">Samples</span>: <span class="rval">'+(result.samples_total||0)+'</span> &nbsp; ';
+    h+='<span class="rkey">First-attempt fail</span>: <span class="rval">'+(result.first_attempt_fail_pct==null?'?':result.first_attempt_fail_pct)+'%</span> &nbsp; ';
+    h+='<span class="rkey">Recovered on retry</span>: <span class="rval">'+(result.recovered_on_retry||0)+'</span> &nbsp; ';
+    h+='<span class="rkey">Hard failures</span>: <span class="rval">'+(result.hard_failures||0)+'</span></div>';
+    function tbl(rows){var t='<table style="width:100%;font-size:11px;margin-top:6px;border-collapse:collapse">';for(var r=0;r<rows.length;r++){t+='<tr>';for(var c=0;c<rows[r].length;c++){var tag=r===0?'th':'td';t+='<'+tag+' style="text-align:left;padding:2px 6px;border-bottom:1px solid var(--border)">'+rows[r][c]+'</'+tag+'>';}t+='</tr>';}return t+'</table>';}
+    var fam=result.by_family||{};var famRows=[['Family','Samples','First-fail %','Hard-fail %']];
+    for(var k in fam){famRows.push([k,fam[k].samples,fam[k].first_fail_pct,fam[k].hard_fail_pct]);}
+    if(famRows.length>1)h+='<div class="rkey" style="margin-top:8px">IPv4 vs IPv6</div>'+tbl(famRows);
+    var bc=result.by_concurrency||{};
+    if(bc.low||bc.high){h+='<div class="rkey" style="margin-top:8px">Low vs high concurrency</div>'+tbl([['Mode','First-fail %','Samples'],['sequential',(bc.low?bc.low.first_fail_pct:'-'),(bc.low?bc.low.samples:'-')],['concurrent',(bc.high?bc.high.first_fail_pct:'-'),(bc.high?bc.high.samples:'-')]]);}
+    var bt=result.by_target||[];if(bt.length){var tr=[['Target','IP?','First-fail %','Hard-fail %','TLS p95']];for(var i=0;i<bt.length;i++){var t=bt[i];tr.push([t.host,(t.is_ip?'yes':'no'),t.first_fail_pct,t.hard_fail_pct,(t.tls_p95==null?'-':t.tls_p95)]);}h+='<div class="rkey" style="margin-top:8px">Per target</div>'+tbl(tr);}
+    el.innerHTML=h;return;
   }
   if(toolId==='health_score_tool'){
     var hs=result.health_score;
