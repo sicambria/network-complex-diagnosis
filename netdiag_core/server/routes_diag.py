@@ -16,6 +16,11 @@ def register(app, state):
     def index():
         return Response(content=page.assemble_index(), media_type="text/html")
 
+    @app.get("/favicon.ico")
+    def favicon():
+        # No favicon asset; return 204 so browsers don't log a 404 console error.
+        return Response(status_code=204)
+
     @app.get("/api/status")
     def api_status(response_class=JSONResponse):
         with state.lock:

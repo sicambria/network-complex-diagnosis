@@ -225,17 +225,68 @@ Patch the canonical module target, not `netdiag.X`. Internal callers use qualifi
 
 **End-to-end**: `test_e2e.sh` — runs syntax checks, pytest, CLI diagnostic, GUI server test, install script validation, and uninstall script validation. Writes timestamped log to `/tmp/netdiag_e2e_*.log`.
 
+### Full test environment (one-shot)
+`make dev-setup` (→ `setup/dev-setup.sh`) installs EVERYTHING needed to fully
+test: system diagnostic tools, `.venv` with all dev/test deps (fastapi, uvicorn,
+pytest, httpx, playwright), the Playwright chromium browser + OS libs, and a
+node check for `make check-js`. It is idempotent; `--check` verifies only,
+`--no-sudo` skips root steps. Then:
+- `make test` — unit + integration (no browser); the default fast suite.
+- `make test-all` — everything, **including the Playwright browser e2e**.
+- `make check-js` — `node --check` on the split frontend JS.
+
+The browser e2e (`tests/test_e2e_browser.py`) launches a real `python3
+netdiag.py --gui` and drives the page with chromium — this is the only check
+that actually *executes* the frontend JavaScript. `make lint`/pytest validate
+Python only.
+
+### Refactor / package foot-guns (learned the hard way)
+- **Module-vs-local name clash.** `full_diagnostic` and `api_monitor` keep a
+  local variable named `wifi`, so the wifi probe **module** must be imported
+  aliased (`from netdiag_core.probes import wifi as wifi_probe`). Importing it
+  as `wifi` makes Python treat `wifi` as a local everywhere in the function →
+  `UnboundLocalError` on `wifi = wifi.wifi_info(...)`. Watch this for any module
+  whose name matches a local.
+- **Stdlib-singleton patches go through the shim.** Tests do
+  `patch.object(netdiag.socket, ...)`, `patch("netdiag.time.sleep")`,
+  `patch("netdiag.Path.is_dir")`. The shim therefore `import`s `socket`, `time`,
+  `threading`, and `Path` so those names exist and patching them mutates the
+  global singletons the probes call. BUT a whole-**name** rebind like
+  `patch("netdiag.Path")` only affects the shim's name — code that uses `Path`
+  in another module (e.g. `cli_main`) must be patched at *its* module
+  (`netdiag_core.cli.Path`). Class-**method** patches (`Path.is_dir`) are global
+  and work via the shim; whole-name rebinds are per-module.
+- **Frontend files are SOURCE, not generated.** `netdiag_core/frontend/**` must
+  be committed; there is no runtime regeneration. A clone missing them 500s on
+  `/static`.
+- **Browser provisioning on bleeding-edge OS/Python.** Playwright won't
+  auto-download a chromium build for an unreleased Ubuntu, and old Playwright
+  won't install on Python 3.14 (greenlet build). The browser e2e falls back to a
+  **cached** browser via `launch_chromium()` (`tests/server_helpers.py`,
+  `executable_path=`) and skips cleanly if none is available — so `make
+  test-all` is green whether or not a browser could be provisioned.
+- **Baseline oracle, not zero failures.** Record the pre-existing failure set
+  before refactoring; "green" means *no NEW* failures. (This box had an
+  unrelated `node` server on :8080 — never blind-kill it; tests must mock the
+  socket bind / use a free port instead of assuming :8080 is free.)
+- **Prove the risky bits byte-for-byte.** `diagnose()` was split across files
+  only after an equivalence harness confirmed identical output on every branch.
+  When restructuring the single source of truth, build that oracle first.
+
 ## Makefile Targets
 
 | Target | What it does |
 |--------|-------------|
+| `dev-setup` | One-shot FULL dev+test env: system tools + venv + all dev deps + Playwright browser + node check (`setup/dev-setup.sh`) |
 | `install` | Full one-click: system deps + pip deps + symlink + desktop icon |
 | `install-sys` | System deps (apt/dnf/pacman/brew) |
 | `install-gui` | fastapi + uvicorn via pip |
 | `desktop-install` | Start menu + desktop icon (all platforms) |
 | `venv` | Python virtual environment with dev deps |
-| `test` | Run pytest (pass ARGS="-k diagnose" to filter) |
-| `lint` | Syntax check via py_compile |
+| `test` | Run pytest, unit + integration, no browser (pass ARGS="-k diagnose") |
+| `test-all` | Complete suite incl. the Playwright browser e2e |
+| `check-js` | `node --check` on the split frontend JS |
+| `lint` | Syntax check (shim + whole `netdiag_core` package) |
 | `run` | Plain CLI mode |
 | `gui` | Web UI mode |
 | `daemon` | Continuous monitoring + web UI |

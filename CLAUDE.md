@@ -18,7 +18,15 @@ See @AGENTS.md for the full project guide: the `netdiag_core/` package architect
 ## Additional commands not in AGENTS.md
 
 ```bash
-# Browser/e2e tests (Playwright + httpx; skip automatically if not installed)
+# One-shot FULL dev+test environment (system tools + venv + all dev deps +
+# Playwright browser + node check). Idempotent; --check verifies only.
+make dev-setup
+make test-all                # complete suite incl. the Playwright browser e2e
+make check-js                # node --check on the split frontend JS
+
+# Browser/e2e tests (Playwright + httpx; skip automatically if not installed).
+# The browser e2e is the only check that actually EXECUTES the frontend JS; it
+# falls back to a cached chromium binary on OSes Playwright can't provision for.
 make install-e2e             # pip install -r requirements-dev.txt + chromium
 make e2e                     # all browser e2e tests (tests/test_e2e_browser.py)
 make e2e-browser             # live-monitor browser tests only

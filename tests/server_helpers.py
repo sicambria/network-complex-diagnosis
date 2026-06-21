@@ -77,4 +77,54 @@ def shutdown_netdiag_server(srv, test_failed=False):
         print(stderr_text[-3000:] if len(stderr_text) > 3000 else stderr_text)
         print("=== END STDERR ===\n")
 
+    return {"alive": alive, "rc": rc, "stderr": stderr_text}
+
+
+def find_cached_chromium():
+    """Return the path to a cached Playwright chromium executable, or None.
+
+    Lets the browser e2e run on platforms Playwright won't auto-provision a
+    browser for (e.g. an unreleased Ubuntu / Python combo) by reusing an
+    already-downloaded build via launch(executable_path=...).
+    """
+    import glob
+    roots = []
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        roots.append(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+    roots.append(os.path.expanduser("~/.cache/ms-playwright"))           # Linux
+    roots.append(os.path.expanduser("~/Library/Caches/ms-playwright"))   # macOS
+    patterns = (
+        "chromium-*/chrome-linux*/chrome",
+        "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell",
+        "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
+        "chromium-*/chrome-win*/chrome.exe",
+    )
+    for root in roots:
+        for pat in patterns:
+            hits = sorted(glob.glob(os.path.join(root, pat)), reverse=True)
+            if hits:
+                return hits[0]
+    return None
+
+
+def launch_chromium(pw, args=None):
+    """Launch a headless chromium for the browser e2e.
+
+    Tries Playwright's normally-provisioned browser first; if that fails
+    (common on too-new OSes Playwright has no build for), falls back to a
+    cached browser binary via executable_path. Calls pytest.skip if neither
+    a provisioned nor a cached browser is available.
+    """
+    import pytest
+    if args is None:
+        args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    try:
+        return pw.chromium.launch(headless=True, args=args)
+    except Exception as primary_err:
+        exe = find_cached_chromium()
+        if not exe:
+            pytest.skip(f"no usable chromium (Playwright can't provision one here and "
+                        f"none cached): {str(primary_err)[:160]}")
+        return pw.chromium.launch(headless=True, args=args, executable_path=exe)
+
     return {"rc": rc, "alive": alive, "stderr": stderr_text}

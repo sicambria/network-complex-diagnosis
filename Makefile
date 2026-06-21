@@ -1,5 +1,5 @@
 .PHONY: all install install-sys install-gui desktop-install test venv gui daemon run clean lint \
-        e2e e2e-browser e2e-stress e2e-smoke install-e2e e2e-req
+        e2e e2e-browser e2e-stress e2e-smoke install-e2e e2e-req dev-setup test-all check-js
 
 PYTHON := python3
 SCRIPT := netdiag.py
@@ -57,7 +57,21 @@ venv:
 # -- Development ----------------------------------------------------------------
 
 test:
-	$(PYTHON) -m pytest tests/ -v $(ARGS)
+	$(GUIPY) -m pytest tests/ --ignore=tests/test_e2e_browser.py -v $(ARGS)
+
+# One-shot: install EVERYTHING needed to develop and fully test (system tools,
+# venv + all dev/test deps, Playwright browser + OS libs, node check).
+dev-setup:
+	bash setup/dev-setup.sh $(ARGS)
+
+# The complete suite, including the Playwright browser e2e. Requires dev-setup.
+test-all:
+	$(GUIPY) -m pytest tests/ -v $(ARGS)
+
+# Frontend JS syntax check (classic scripts loaded in order; needs node).
+check-js:
+	@command -v node >/dev/null 2>&1 || { echo "node not installed — run 'make dev-setup'"; exit 1; }
+	@for f in netdiag_core/frontend/js/*.js; do node --check "$$f" && echo "  OK $$f"; done
 
 lint:
 	$(PYTHON) -c "import py_compile; py_compile.compile('$(SCRIPT)', doraise=True)"

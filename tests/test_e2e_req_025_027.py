@@ -224,12 +224,11 @@ class TestReq025GUIFrontend:
     @pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="playwright not installed")
     def test_req_025_frontend_live_monitor_tab(self, gui_server):
         from playwright.sync_api import sync_playwright
+        from tests.server_helpers import launch_chromium
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--disable-dev-shm-usage", "--disable-gpu",
-                      "--no-sandbox", "--disable-extensions"],
-            )
+            browser = launch_chromium(pw, args=[
+                "--disable-dev-shm-usage", "--disable-gpu",
+                "--no-sandbox", "--disable-extensions"])
             context = browser.new_context()
             page = context.new_page()
             errors = []

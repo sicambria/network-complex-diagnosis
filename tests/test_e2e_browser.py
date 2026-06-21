@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from tests.server_helpers import init_netdiag_server, shutdown_netdiag_server
+from tests.server_helpers import init_netdiag_server, shutdown_netdiag_server, launch_chromium
 
 PLAYWRIGHT = None
 try:
@@ -29,16 +29,13 @@ class TestLiveMonitorBrowser:
         test_failed = False
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--no-sandbox",
-                        "--disable-extensions",
-                        "--mute-audio",
-                    ],
-                )
+                browser = launch_chromium(pw, args=[
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-extensions",
+                    "--mute-audio",
+                ])
                 context = browser.new_context()
                 page = context.new_page()
 
