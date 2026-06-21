@@ -74,7 +74,10 @@ main{padding:20px;max-width:1100px;margin:0 auto}
 .btn-orange:disabled{box-shadow:none;transform:none}
 @keyframes pulse-orange{0%,100%{box-shadow:0 0 24px rgba(249,115,22,0.45)}50%{box-shadow:0 0 48px rgba(249,115,22,0.8)}}
 .progress-bar{height:4px;background:var(--border);border-radius:2px;margin:8px 0;overflow:hidden}
-.progress-bar-fill{height:100%;background:var(--orange);transition:width .3s}
+.progress-bar-lg{height:10px;border-radius:5px;margin:0}
+.progress-bar-fill{height:100%;background:var(--orange);transition:width .4s ease}
+.progress-bar-fill.running{background:linear-gradient(90deg,#ea580c 0%,var(--orange) 40%,#fb923c 60%,var(--orange) 100%);background-size:300% 100%;animation:progress-shimmer 1.8s linear infinite}
+@keyframes progress-shimmer{0%{background-position:100% center}100%{background-position:-200% center}}
 .chart-container{height:200px;margin:12px 0}
 table{width:100%;border-collapse:collapse}
 th,td{padding:8px 12px;text-align:left;font-size:12px;border-bottom:1px solid var(--border)}

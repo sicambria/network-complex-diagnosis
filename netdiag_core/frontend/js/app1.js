@@ -242,8 +242,10 @@ function startDiagnostic(opts,dash){
   if(progList){progList.innerHTML='';progList.style.display='block';}
   if(healthLive)healthLive.style.display='none';
   if(stack)stack.style.display='none';
-  if(fillEl)fillEl.style.width='0%';
+  if(fillEl){fillEl.style.width='0%';fillEl.className='progress-bar-fill';}
   if(labelEl)labelEl.textContent='';
+  let pctElInit=document.getElementById(prefix+'progress-pct');
+  if(pctElInit)pctElInit.textContent='';
 
   fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts||getOpts())}).then(function(r){return r.json();}).then(function(data){
     if(data.status!=='ok'){if(statusEl)statusEl.textContent='Error: '+data.message;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}if(stopBtn)stopBtn.style.display='none';isRunning=false;return;}
@@ -253,8 +255,12 @@ function startDiagnostic(opts,dash){
         let run=entries.filter(function(e){return e.status==='running';}).length;
         let don=entries.filter(function(e){return e.status!=='running';}).length;
         let tot=run+don;
-        if(fillEl)fillEl.style.width=(tot>0?don/tot*100:0)+'%';
-        if(labelEl)labelEl.textContent=don+'/'+tot+' checks';
+        let pct=tot>0?Math.round(don/tot*100):0;
+        let runningProbe=entries.find(function(e){return e.status==='running';});
+        if(fillEl){fillEl.style.width=pct+'%';fillEl.className='progress-bar-fill running';}
+        if(labelEl)labelEl.textContent=runningProbe?'Checking '+pretty(runningProbe.label)+'...':don+'/'+tot+' checks';
+        let pctEl=document.getElementById(prefix+'progress-pct');
+        if(pctEl)pctEl.textContent=pct+'%';
 
         let html='',hScore=0,hCnt=0;
         for(let i=0;i<entries.length;i++){
@@ -281,8 +287,10 @@ function startDiagnostic(opts,dash){
           if(stopBtn){stopBtn.style.display='none';stopBtn.disabled=false;stopBtn.textContent='Stop';}
           if(s.status==='error'){if(statusEl)statusEl.textContent='Error: '+s.error;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}return;}
           if(statusEl)statusEl.textContent=(s.status==='stopped')?'Stopped — partial results below.':'Diagnostic complete.';
-          if(fillEl)fillEl.style.width='100%';
-          if(labelEl)labelEl.textContent=(s.status==='stopped')?'Stopped':'Done';
+          if(fillEl){fillEl.style.width='100%';fillEl.className='progress-bar-fill';}
+          if(labelEl)labelEl.textContent=(s.status==='stopped')?'Stopped':'All checks complete';
+          let pctElDone=document.getElementById(prefix+'progress-pct');
+          if(pctElDone)pctElDone.textContent=(s.status==='stopped')?'':'100%';
           if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}
           if(stack&&s.results){stack.style.display='block';renderResults(s.results,stackLayers,logDiv);}
           if(s.results&&s.results.health_score!=null){updateDashboard(s.results);}
