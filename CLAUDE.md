@@ -11,7 +11,8 @@ See @AGENTS.md for the full project guide: architecture of `netdiag.py` (single 
 - Every probe needs Linux/macOS/Windows branches with stdlib fallbacks (see the Graceful Degradation table in AGENTS.md).
 - Verify changes end-to-end before reporting done (`make lint`, `make test`, restart the GUI server after server/frontend edits).
 - Setup must work first time from a clean checkout. System Python is PEP-668 externally-managed, so GUI/test deps (`fastapi`, `uvicorn`, `httpx`, `pytest`) live in `.venv` — `make gui`/`daemon`/`install-gui` use it. Prove it with `rm -rf .venv` before claiming done.
-- Never blind-kill a port (`kill $(lsof -ti:8080)` can kill an unrelated dev server). Scope kills to netdiag: `pkill -f "netdiag.py.*--gui"`. netdiag refuses a busy port with a clear `--port` hint instead of clobbering it.
+- Never blind-kill a port (`kill $(lsof -ti:8080)` can kill an unrelated dev server). Scope kills to netdiag: `pkill -f "netdiag.py.*--gui"`. netdiag refuses a busy port with a clear `--port` hint instead of clobbering it. Caveat: `pkill -f "netdiag.py.*--gui"` matches its own parent shell's argv when embedded in a larger scripted command (kills the shell, exit 144) — inside a compound command, kill by PID (`ss -ltnp 'sport = :PORT'` → `kill <pid>`). See AGENTS.md.
+- **GUI Stop button** = cooperative cancellation: `POST /api/stop` sets a `threading.Event` that `full_diagnostic(..., should_stop=)` polls at probe boundaries and inside the progress callback (raises `UserInterrupted`), yielding a partial report with `interrupted=True` and `status="stopped"`. Keep that Event a closure var, never a `current_run` key (it would break `api_status` JSON encoding). See AGENTS.md "Stop button / cooperative cancellation".
 - Capture non-obvious operational lessons (foot-guns, environment gotchas, setup fixes) into AGENTS.md and CLAUDE.md as part of finishing the task — so they do not recur.
 
 ## Additional commands not in AGENTS.md

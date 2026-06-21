@@ -54,9 +54,29 @@ netdiag.py (~3340 lines, single file)
 ├── write_report() / csv    — report.txt + diagnostics.json + CSVs
 ├── build_isp_report()      — detailed plain-text evidence report for ISP tickets (isp_report.txt; export format=isp). Leads with the ICMP-vs-TCP method note; separates local vs upstream; side-by-side ICMP/TCP table.
 ├── build_parser() / CLI    — argparse + default args (--wellknown-test, --isp-report)
-├── Server (FastAPI)         — /api/export/{file}?format=json|csv|html|isp + the run/status/monitor/history routes
+├── Server (FastAPI)         — /api/export/{file}?format=json|csv|html|isp + the run/stop/status/monitor/history routes
 └── Frontend (embedded HTML) — renders diagnose() output verbatim (Findings = interpretation, Measurements = raw values). NEVER recompute severity in JS — see "Single source of truth" below.
 ```
+
+### Stop button / cooperative cancellation (GUI)
+A running diagnostic is a `daemon` thread — you cannot signal it from outside, so
+Stop is **cooperative**. `POST /api/stop` sets a `threading.Event` (`stop_event`),
+which `full_diagnostic(args, callback, should_stop)` polls two ways:
+(1) `_stopcheck()` at every slow-probe boundary, so no new probe starts after Stop;
+(2) the GUI progress `cb` raises `UserInterrupted` when the flag is set, which
+unwinds the long callback-driven probes mid-run (ping bursts, reliability/wellknown
+rounds — so the ~2.5 min 100-site reproducer aborts in seconds, not minutes).
+Both land in `full_diagnostic`'s `except UserInterrupted`, which still runs
+reconcile/diagnose/health on the partial data → `interrupted=True`, a "Test was
+interrupted" finding, and `run_state["status"]="stopped"`. The frontend treats
+`stopped` as terminal (alongside `done`/`error`) and renders the partial report.
+Two foot-guns, both load-bearing:
+- **Keep `stop_event` a closure variable, NOT a key in `current_run`.** `api_status`
+  does `dict(current_run)` then JSON-encodes it; a `threading.Event` isn't
+  serializable, so stashing it there 500s *every* status poll and freezes the UI.
+- Clear the flag in `api_run` under the lock (with the run reset), not in the
+  worker — otherwise a click during thread startup is lost, or a stale Stop from a
+  prior run cancels the new one.
 
 ### Diagnosis schema & single source of truth (IMPORTANT)
 Each diagnosis dict is `{layer, severity, title, detail, fix}` PLUS optional
@@ -224,6 +244,7 @@ All tests use `unittest.mock` to avoid real subprocess/socket calls. Server test
 - Ban "should work" / "should be fine" / speculative language. There is evidence or there isn't. Test it, show the evidence, or don't claim it.
 - **Setup must fully work first time.** Every install/launch path (`make` targets, scripts, the snippets in these docs) must succeed from a clean checkout on a fresh machine — no manual venv/dep steps assumed. This host's system Python is PEP-668 externally-managed, so a system-wide `pip install` is blocked: GUI/test deps (`fastapi`, `uvicorn`, `httpx`, `pytest`) go in `.venv`, never system-wide. Prove it from a clean state (`rm -rf .venv` then the documented path) before claiming done.
 - **Never blind-kill by port.** `kill $(lsof -ti:8080)` murders whatever holds the port — often an unrelated dev server (e.g. another project on :8080). Always scope kills to netdiag (`pkill -f "netdiag.py.*--gui"`) and check what is listening before touching a port.
+- **`pkill -f` can kill your own shell.** `pkill -f "netdiag.py.*--gui"` matches the *full command line* of every process — including the `bash -c "..."` running your kill command, because that pattern string is literally in its argv. pkill spares its own PID but not the parent shell, so the script dies mid-run (exit 144 = SIGSTKFLT). When you need a clean kill inside a scripted step, kill by PID instead: `ss -ltnp 'sport = :PORT'` → `kill <pid>`. The bare `pkill -f "netdiag.py.*--gui"` line is safe only when it's the whole command, not embedded in a larger compound command that echoes the pattern.
 - **Capture operational insights into AGENTS.md and CLAUDE.md.** When a session surfaces a non-obvious lesson — a foot-gun, an environment gotcha (PEP-668, missing test dep), a setup fix, a process-safety rule — record it in these guides so it does not recur. Treat that as part of finishing the task, not optional.
 
 - **Server restart**: After any code change, kill the old GUI process and start a fresh one:

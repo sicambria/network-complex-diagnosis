@@ -41,3 +41,22 @@ class TestServerRoutes:
         app, _, _ = self._make_app()
         routes = [r.path for r in app.routes]
         assert "/api/history" in routes
+
+    def test_stop_endpoint_exists(self):
+        if fastapi is None:
+            return
+        app, _, _ = self._make_app()
+        routes = [r.path for r in app.routes]
+        assert "/api/stop" in routes
+
+    def test_stop_returns_ok_when_idle(self):
+        if fastapi is None:
+            return
+        from fastapi.testclient import TestClient
+        app, _, _ = self._make_app()
+        client = TestClient(app)
+        resp = client.post("/api/stop")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["stopping"] is False

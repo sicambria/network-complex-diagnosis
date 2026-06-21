@@ -2639,7 +2639,15 @@ def print_console_summary(results, outdir):
     print(f"\nFiles written to: {Path(outdir).resolve()}")
 
 
-def full_diagnostic(args, callback=None):
+def full_diagnostic(args, callback=None, should_stop=None):
+    # should_stop() is a cheap predicate (the GUI Stop button sets it). Checked at
+    # probe boundaries so no new probe starts after a stop; the long callback-driven
+    # probes interrupt mid-run via the callback raising UserInterrupted. Both paths
+    # land in the except below, which still computes a coherent partial report.
+    def _stopcheck():
+        if should_stop and should_stop():
+            raise UserInterrupted("Stopped by user")
+
     tools = check_tools()
     gateway = detect_gateway()
     default_iface = get_default_interface()
@@ -2708,6 +2716,7 @@ def full_diagnostic(args, callback=None):
                 callback("ethtool", 1, 1, ok, 0, "done" if ethtool else "error")
 
         if gateway:
+            _stopcheck()
             if callback:
                 callback("gateway", 0, args.count, None, None, "running")
             gw_result = ping_burst(
@@ -2721,6 +2730,7 @@ def full_diagnostic(args, callback=None):
             print("No gateway detected.", flush=True)
 
         for host in args.hosts:
+            _stopcheck()
             label = host
             if callback:
                 callback(label, 0, args.count, None, None, "running")
@@ -2759,6 +2769,7 @@ def full_diagnostic(args, callback=None):
                 ok = 1 if (ts and ts.get("retransmit_pct", 100) < 5) else 0
                 callback("tcp_sockets", 1, 1, ok, ts.get("retransmit_pct", 0) if ts else 0, "done" if ts else "error")
             if not args.no_bufferbloat:
+                _stopcheck()
                 if callback:
                     callback("bufferbloat", 0, 1, None, None, "running")
                 results["bufferbloat"] = bufferbloat_test(default_iface)
@@ -2768,6 +2779,7 @@ def full_diagnostic(args, callback=None):
                     callback("bufferbloat", 1, 1, ok, int((bb.get("ratio", 0) or 0) * 100), "done" if bb else "error")
 
         if not args.no_trace and args.hosts:
+            _stopcheck()
             if not args.quiet:
                 print(f"Testing route: {args.hosts[0]}", flush=True)
             if callback:
@@ -2779,6 +2791,7 @@ def full_diagnostic(args, callback=None):
                 callback("mtr", 1, 1, ok, 0, "done" if m else "error")
 
         if not args.no_speedtest:
+            _stopcheck()
             if not args.quiet:
                 print("Running speedtest...", flush=True)
             if callback:
@@ -2790,6 +2803,7 @@ def full_diagnostic(args, callback=None):
                 callback("speedtest", 1, 1, ok, int(s.get("download_mbps", 0) or 0) if s else 0, "done" if s else "error")
 
         if not args.no_iperf:
+            _stopcheck()
             if not args.quiet:
                 print("Running iPerf3...", flush=True)
             if callback:
@@ -2802,6 +2816,7 @@ def full_diagnostic(args, callback=None):
                 callback("iperf3", 1, 1, ok, mbits, "done" if (i3 and i3.get("available")) else "error")
 
         if getattr(args, "download_test", False):
+            _stopcheck()
             if not args.quiet:
                 print("Download test: 100 images...", flush=True)
             if callback:
@@ -2813,6 +2828,7 @@ def full_diagnostic(args, callback=None):
                 callback("download_test", ok, 100, ok, dt.get("avg_mbps", 0), "done" if dt.get("error") is None else "error")
 
         if getattr(args, "connection_test", False):
+            _stopcheck()
             if not args.quiet:
                 print("Connection test: HTTP latency + MTU probe...", flush=True)
             if callback:
@@ -2831,6 +2847,7 @@ def full_diagnostic(args, callback=None):
                 callback("mtu_probe", 1, 1, ok, mp.get("mtu", 0), "done" if mp.get("available") else "error")
 
         if getattr(args, "reliability_test", False):
+            _stopcheck()
             cfg = load_config(getattr(args, "history_dir", "~/.netdiag"))
             if not args.quiet:
                 print("Reliability test: intermittent connection detector...", flush=True)
@@ -2852,6 +2869,7 @@ def full_diagnostic(args, callback=None):
                          ok, ff, "done" if rel.get("available") else "error")
 
         if getattr(args, "wellknown_test", False):
+            _stopcheck()
             cfg = load_config(getattr(args, "history_dir", "~/.netdiag"))
             if not args.quiet:
                 print("Intermittent reproduction: probing ~100 well-known sites (~2.5 min)...", flush=True)
@@ -3624,6 +3642,10 @@ def build_app():
     app = FastAPI(title="NetDiag")
     lock = threading.Lock()
     current_run = {"status": "idle", "progress": {}, "results": None, "error": None}
+    # Cooperative-cancellation flag for the GUI Stop button. Kept as a separate
+    # closure variable (NOT inside current_run) so it never reaches api_status's
+    # JSON encoder — a threading.Event isn't serializable and would 500 every poll.
+    stop_event = threading.Event()
 
     def run_diag(args, run_state):
         try:
@@ -3638,10 +3660,15 @@ def build_app():
                     run_state["progress"][label] = {
                         "seq": seq, "total": total, "ok": ok,
                         "rtt_ms": rtt, "status": st, "label": label}
+                # Mid-probe cancellation: raising here unwinds the long callback-
+                # driven probes (ping bursts, reliability/wellknown rounds) so Stop
+                # is responsive even inside the ~2.5 min 100-site reproducer.
+                if stop_event.is_set():
+                    raise UserInterrupted("Stopped by user")
 
-            results = full_diagnostic(args, callback=cb)
+            results = full_diagnostic(args, callback=cb, should_stop=stop_event.is_set)
             with lock:
-                run_state["status"] = "done"
+                run_state["status"] = "stopped" if results.get("interrupted") else "done"
                 run_state["results"] = results
                 save_history(args.history_dir, results)
         except Exception as e:
@@ -3728,6 +3755,7 @@ main{padding:20px;max-width:1100px;margin:0 auto}
 .btn{background:var(--accent);color:#000;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
 .btn:hover{opacity:.9}
 .btn:disabled{opacity:.5;cursor:default}
+.btn-danger{background:var(--red);color:#fff}
 .btn-secondary{background:var(--border);color:var(--fg)}
 .btn-orange{background:var(--orange);color:#fff;font-size:16px;padding:14px 36px;box-shadow:0 0 24px rgba(249,115,22,0.45);transition:all .2s}
 .btn-orange:hover{box-shadow:0 0 36px rgba(249,115,22,0.65);transform:translateY(-1px)}
@@ -3926,6 +3954,7 @@ th{color:var(--info);font-weight:500}
 <h2>Network Diagnostic</h2>
 <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
 <button class="btn" id="run-btn" onclick="runDiagnostic()">Run Full Diagnostic</button>
+<button class="btn btn-danger" id="stop-btn" onclick="stopDiagnostic()" style="display:none">Stop</button>
 <span id="run-status" style="font-size:12px;color:var(--info)"></span>
 </div>
 <div class="options-toggle" onclick="toggleOptions()">&#x25B6; Options</div>
@@ -4953,6 +4982,7 @@ function startDiagnostic(opts,dash){
   let fillEl=document.getElementById(prefix+'progress-fill');
   let labelEl=document.getElementById(prefix+'progress-label');
   let btn=document.getElementById(prefix+'run-btn');
+  let stopBtn=dash?null:document.getElementById('stop-btn');
   let logDiv=document.getElementById('log-output');
   let progList=document.getElementById('prog-list');
   let stack=document.getElementById('stack-card');
@@ -4963,6 +4993,7 @@ function startDiagnostic(opts,dash){
 
   isRunning=true;
   if(btn){btn.disabled=true;btn.textContent='Running...';}
+  if(stopBtn){stopBtn.style.display='';stopBtn.disabled=false;stopBtn.textContent='Stop';}
   if(statusEl)statusEl.textContent='Running...';
   if(progressEl)progressEl.style.display='block';
   if(logDiv)logDiv.textContent='';
@@ -4973,7 +5004,7 @@ function startDiagnostic(opts,dash){
   if(labelEl)labelEl.textContent='';
 
   fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts||getOpts())}).then(function(r){return r.json();}).then(function(data){
-    if(data.status!=='ok'){if(statusEl)statusEl.textContent='Error: '+data.message;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}isRunning=false;return;}
+    if(data.status!=='ok'){if(statusEl)statusEl.textContent='Error: '+data.message;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}if(stopBtn)stopBtn.style.display='none';isRunning=false;return;}
     function poll(){
       fetch('/api/status').then(function(r){return r.json();}).then(function(s){
         let entries=Object.values(s.progress||{});
@@ -5003,20 +5034,29 @@ function startDiagnostic(opts,dash){
           if(healthVal)healthVal.textContent=avg;
         }
 
-        if(s.status==='done'||s.status==='error'){
+        if(s.status==='done'||s.status==='error'||s.status==='stopped'){
           isRunning=false;
+          if(stopBtn){stopBtn.style.display='none';stopBtn.disabled=false;stopBtn.textContent='Stop';}
           if(s.status==='error'){if(statusEl)statusEl.textContent='Error: '+s.error;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}return;}
-          if(statusEl)statusEl.textContent='Diagnostic complete.';
+          if(statusEl)statusEl.textContent=(s.status==='stopped')?'Stopped — partial results below.':'Diagnostic complete.';
           if(fillEl)fillEl.style.width='100%';
-          if(labelEl)labelEl.textContent='Done';
+          if(labelEl)labelEl.textContent=(s.status==='stopped')?'Stopped':'Done';
           if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}
-          if(stack){stack.style.display='block';renderResults(s.results,stackLayers,logDiv);}
+          if(stack&&s.results){stack.style.display='block';renderResults(s.results,stackLayers,logDiv);}
           if(s.results&&s.results.health_score!=null){updateDashboard(s.results);}
         }else{setTimeout(poll,500);}
       }).catch(function(){setTimeout(poll,500);});
     }
     poll();
-  }).catch(function(e){if(statusEl)statusEl.textContent='Error: '+e;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}isRunning=false;});
+  }).catch(function(e){if(statusEl)statusEl.textContent='Error: '+e;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}if(stopBtn)stopBtn.style.display='none';isRunning=false;});
+}
+
+function stopDiagnostic(){
+  let stopBtn=document.getElementById('stop-btn');
+  let statusEl=document.getElementById('run-status');
+  if(stopBtn){stopBtn.disabled=true;stopBtn.textContent='Stopping...';}
+  if(statusEl)statusEl.textContent='Stopping... (finishing current probe)';
+  fetch('/api/stop',{method:'POST'}).catch(function(){});
 }
 
 function dashRunDiag(){
@@ -5866,6 +5906,9 @@ function renderToolResult(toolId,result,el){
             current_run["progress"] = {}
             current_run["results"] = None
             current_run["error"] = None
+            # Reset the Stop flag atomically with the run reset so a stale stop from
+            # a prior run can't cancel this one before it starts.
+            stop_event.clear()
 
         parser = build_parser()
         args = parser.parse_args([])
@@ -5889,6 +5932,16 @@ function renderToolResult(toolId,result,el){
         thread = threading.Thread(target=run_diag, args=(args, current_run), daemon=True)
         thread.start()
         return JSONResponse(content={"status": "ok", "session_id": now_iso().replace(":", "")})
+
+    @app.post("/api/stop")
+    def api_stop():
+        # Cooperative cancel: set the flag the running diagnostic polls at probe
+        # boundaries and inside its progress callback. The worker finishes the
+        # current in-flight probe, then unwinds and saves a partial report.
+        with lock:
+            was_running = current_run["status"] == "running"
+        stop_event.set()
+        return JSONResponse(content={"status": "ok", "stopping": was_running})
 
     @app.get("/api/reports")
     def api_reports(response_class=JSONResponse):

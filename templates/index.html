@@ -73,6 +73,7 @@ main{padding:20px;max-width:1100px;margin:0 auto}
 .btn{background:var(--accent);color:#000;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
 .btn:hover{opacity:.9}
 .btn:disabled{opacity:.5;cursor:default}
+.btn-danger{background:var(--red);color:#fff}
 .btn-secondary{background:var(--border);color:var(--fg)}
 .btn-orange{background:var(--orange);color:#fff;font-size:16px;padding:14px 36px;box-shadow:0 0 24px rgba(249,115,22,0.45);transition:all .2s}
 .btn-orange:hover{box-shadow:0 0 36px rgba(249,115,22,0.65);transform:translateY(-1px)}
@@ -271,6 +272,7 @@ th{color:var(--info);font-weight:500}
 <h2>Network Diagnostic</h2>
 <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
 <button class="btn" id="run-btn" onclick="runDiagnostic()">Run Full Diagnostic</button>
+<button class="btn btn-danger" id="stop-btn" onclick="stopDiagnostic()" style="display:none">Stop</button>
 <span id="run-status" style="font-size:12px;color:var(--info)"></span>
 </div>
 <div class="options-toggle" onclick="toggleOptions()">&#x25B6; Options</div>
@@ -1298,6 +1300,7 @@ function startDiagnostic(opts,dash){
   let fillEl=document.getElementById(prefix+'progress-fill');
   let labelEl=document.getElementById(prefix+'progress-label');
   let btn=document.getElementById(prefix+'run-btn');
+  let stopBtn=dash?null:document.getElementById('stop-btn');
   let logDiv=document.getElementById('log-output');
   let progList=document.getElementById('prog-list');
   let stack=document.getElementById('stack-card');
@@ -1308,6 +1311,7 @@ function startDiagnostic(opts,dash){
 
   isRunning=true;
   if(btn){btn.disabled=true;btn.textContent='Running...';}
+  if(stopBtn){stopBtn.style.display='';stopBtn.disabled=false;stopBtn.textContent='Stop';}
   if(statusEl)statusEl.textContent='Running...';
   if(progressEl)progressEl.style.display='block';
   if(logDiv)logDiv.textContent='';
@@ -1318,7 +1322,7 @@ function startDiagnostic(opts,dash){
   if(labelEl)labelEl.textContent='';
 
   fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts||getOpts())}).then(function(r){return r.json();}).then(function(data){
-    if(data.status!=='ok'){if(statusEl)statusEl.textContent='Error: '+data.message;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}isRunning=false;return;}
+    if(data.status!=='ok'){if(statusEl)statusEl.textContent='Error: '+data.message;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}if(stopBtn)stopBtn.style.display='none';isRunning=false;return;}
     function poll(){
       fetch('/api/status').then(function(r){return r.json();}).then(function(s){
         let entries=Object.values(s.progress||{});
@@ -1348,20 +1352,29 @@ function startDiagnostic(opts,dash){
           if(healthVal)healthVal.textContent=avg;
         }
 
-        if(s.status==='done'||s.status==='error'){
+        if(s.status==='done'||s.status==='error'||s.status==='stopped'){
           isRunning=false;
+          if(stopBtn){stopBtn.style.display='none';stopBtn.disabled=false;stopBtn.textContent='Stop';}
           if(s.status==='error'){if(statusEl)statusEl.textContent='Error: '+s.error;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}return;}
-          if(statusEl)statusEl.textContent='Diagnostic complete.';
+          if(statusEl)statusEl.textContent=(s.status==='stopped')?'Stopped — partial results below.':'Diagnostic complete.';
           if(fillEl)fillEl.style.width='100%';
-          if(labelEl)labelEl.textContent='Done';
+          if(labelEl)labelEl.textContent=(s.status==='stopped')?'Stopped':'Done';
           if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}
-          if(stack){stack.style.display='block';renderResults(s.results,stackLayers,logDiv);}
+          if(stack&&s.results){stack.style.display='block';renderResults(s.results,stackLayers,logDiv);}
           if(s.results&&s.results.health_score!=null){updateDashboard(s.results);}
         }else{setTimeout(poll,500);}
       }).catch(function(){setTimeout(poll,500);});
     }
     poll();
-  }).catch(function(e){if(statusEl)statusEl.textContent='Error: '+e;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}isRunning=false;});
+  }).catch(function(e){if(statusEl)statusEl.textContent='Error: '+e;if(btn){btn.disabled=false;btn.textContent='Start Diagnosis';}if(stopBtn)stopBtn.style.display='none';isRunning=false;});
+}
+
+function stopDiagnostic(){
+  let stopBtn=document.getElementById('stop-btn');
+  let statusEl=document.getElementById('run-status');
+  if(stopBtn){stopBtn.disabled=true;stopBtn.textContent='Stopping...';}
+  if(statusEl)statusEl.textContent='Stopping... (finishing current probe)';
+  fetch('/api/stop',{method:'POST'}).catch(function(){});
 }
 
 function dashRunDiag(){
