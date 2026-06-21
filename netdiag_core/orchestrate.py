@@ -29,6 +29,7 @@ def full_diagnostic(args, callback=None, should_stop=None):
     tools = rt.check_tools()
     gateway = netinfo.detect_gateway()
     default_iface = netinfo.get_default_interface()
+    vpn = netinfo.detect_vpn()
 
     results = {
         "timestamp": rt.now_iso(),
@@ -36,6 +37,7 @@ def full_diagnostic(args, callback=None, should_stop=None):
         "os": rt.OS_NAME,
         "default_interface": default_iface,
         "gateway": gateway,
+        "vpn": vpn,
         "interface": None,
         "wifi": None,
         "ethtool": None,

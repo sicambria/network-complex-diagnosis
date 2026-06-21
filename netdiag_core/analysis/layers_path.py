@@ -104,7 +104,66 @@ def _diag_mtr(results):
             if (hop.get("loss_pct", 0) or 0) > 5:
                 first_mid = hop
                 break
-        if dest_loss > 5:
+
+        # Same cardinal rule as the internet layer: a real >5% end-to-end loss
+        # cannot coexist with working TCP handshakes + HTTPS + DNS (each needs
+        # several consecutive round trips). If the transport layer is healthy, the
+        # ICMP "loss" reaching the final hop is the destination — or, under a VPN,
+        # the tunnel — rate-limiting echo replies, not packet loss on the path.
+        recon = get_reconciliation(results)
+        transport_ok = recon["dns_ok_global"] and (recon["tcp_ok_global"] or recon["http_ok_global"])
+        vpn = results.get("vpn") or {}
+        vpn_active = bool(vpn.get("active"))
+        vpn_iface = vpn.get("interface")
+
+        if dest_loss > 5 and transport_ok:
+            facts = ["Destination hop %s reports %s%% ICMP loss." % (last.get("hop"), dest_loss)]
+            if first_mid:
+                facts.append("Loss first appears at hop %s (%s%%)." % (first_mid["hop"], first_mid.get("loss_pct")))
+            if recon["tcp_ok_global"] or recon["http_ok_global"]:
+                facts.append("Yet TCP/HTTPS connections over this same path succeed.")
+            if recon["dns_ok_global"]:
+                facts.append("DNS resolution over the same path succeeds.")
+            if vpn_active:
+                facts.append("This trace runs through a VPN tunnel (%s), so hop 1 is the VPN server, "
+                             "not your modem." % vpn_iface)
+            diagnoses.append({"layer": "isp", "severity": "info",
+                              "title": "MTR shows ICMP loss, but the working transport disproves packet loss",
+                              "detail": "The trace reports %s%% loss at the destination, but TCP/HTTPS/DNS over "
+                                        "the same path succeed%s." % (dest_loss,
+                                        (" (the path runs through VPN tunnel %s)" % vpn_iface) if vpn_active else ""),
+                              "facts": facts,
+                              "assumption": "A genuine high end-to-end loss rate cannot coexist with near-100%% "
+                                            "TCP handshake and HTTPS success. The missing ICMP replies are "
+                                            "deprioritized by the destination%s, not lost on your line."
+                                            % (" or the VPN tunnel" if vpn_active else ""),
+                              "confidence": "high",
+                              "fix": "Disregard this MTR loss figure; judge real loss from the gateway ping, the "
+                                     "TCP/HTTPS tests, and the reliability probe."
+                                     + (" To trace the real underlying path, re-run with the VPN disconnected."
+                                        if vpn_active else "")})
+        elif dest_loss > 5 and vpn_active:
+            # Genuine-looking loss, but the path egresses through a VPN — the early
+            # hops are the encrypted tunnel to the VPN server, NOT the local modem.
+            hop_num = (first_mid or last)["hop"]
+            facts = ["Destination hop %s shows %s%% loss." % (last.get("hop"), dest_loss)]
+            if first_mid:
+                facts.append("Loss first appears at hop %s (%s%%) and persists to the destination."
+                             % (first_mid["hop"], first_mid.get("loss_pct")))
+            facts.append("This trace runs through a VPN tunnel (%s); hop 1 is the VPN server, not your modem."
+                         % vpn_iface)
+            diagnoses.append({"layer": "isp", "severity": "warning",
+                              "title": "Packet loss on the VPN tunnel path",
+                              "detail": "End-to-end loss begins at hop %s, but the path runs through a VPN "
+                                        "tunnel (%s)." % (hop_num, vpn_iface),
+                              "facts": facts,
+                              "assumption": "Because traffic egresses through a VPN, the early hops are the "
+                                            "encrypted tunnel to the VPN server — loss here points to the VPN "
+                                            "server/route, not your modem or local uplink.",
+                              "confidence": "medium",
+                              "fix": "Reconnect or switch VPN server, or disconnect the VPN and re-run to see the "
+                                     "real path. If the loss only appears with the VPN on, it is the VPN, not your line."})
+        elif dest_loss > 5:
             culprit = first_mid or last
             hop_num = culprit["hop"]
             facts = ["Destination hop %s shows %s%% loss (loss reaches the endpoint)." % (last.get("hop"), dest_loss)]

@@ -200,6 +200,57 @@ class TestDiagnose:
         assert any(d["layer"] == "isp" and d["severity"] == "info" for d in diag)
         assert not any(d["layer"] == "isp" and d["severity"] == "bad" for d in diag)
 
+    def test_mtr_dest_loss_with_working_transport_is_rate_limiting(self):
+        # Loss reaching the destination would normally be "real", but TCP+DNS over
+        # the same path succeed — so the ICMP loss is the destination (or a tunnel)
+        # rate-limiting echoes, NOT packet loss. Must be info, never a 'bad' modem
+        # verdict. (This is the live false-positive: 70% hop-1 / 20% dest, yet TCP
+        # handshakes all succeed.)
+        results = _make_results({
+            "dns": [{"failure_pct": 0}],
+            "tcp": [{"host": "1.1.1.1", "port": 443, "failure_pct": 0}],
+            "mtr": {"tool": "mtr", "host": "1.1.1.1", "hops": [
+                {"hop": 1, "loss_pct": 70, "avg_ms": 5},
+                {"hop": 2, "loss_pct": 30, "avg_ms": 10},
+                {"hop": 3, "loss_pct": 20, "avg_ms": 15},
+            ]},
+        })
+        diag = diagnose(results)
+        isp = [d for d in diag if d["layer"] == "isp"]
+        assert any(d["severity"] == "info" for d in isp)
+        assert not any(d["severity"] == "bad" for d in isp)
+        assert not any("first hops" in d["title"].lower() for d in isp)
+
+    def test_mtr_first_hop_loss_under_vpn_blames_tunnel_not_modem(self):
+        # Same first-hop loss as test_mtr_first_hop_loss, but the path egresses
+        # through a VPN tunnel — hop 1 is the VPN server, not the modem. Must NOT
+        # emit the 'your modem/local uplink' verdict.
+        results = _make_results({
+            "vpn": {"active": True, "interface": "proton0", "kind": "vpn"},
+            "mtr": {"tool": "mtr", "host": "1.1.1.1", "hops": [
+                {"hop": 1, "loss_pct": 70, "avg_ms": 5},
+                {"hop": 2, "loss_pct": 20, "avg_ms": 10},
+            ]},
+        })
+        diag = diagnose(results)
+        isp = [d for d in diag if d["layer"] == "isp"]
+        assert any("tunnel" in d["title"].lower() for d in isp)
+        assert not any("first hops" in d["title"].lower() for d in isp)
+        assert not any(d["severity"] == "bad" for d in isp)
+
+    def test_mtr_first_hop_loss_no_vpn_no_transport_still_blames_modem(self):
+        # Regression guard: with neither a VPN nor proven transport, the original
+        # first-hop modem verdict must still fire.
+        results = _make_results({
+            "mtr": {"tool": "mtr", "host": "1.1.1.1", "hops": [
+                {"hop": 1, "loss_pct": 40, "avg_ms": 5},
+                {"hop": 2, "loss_pct": 35, "avg_ms": 10},
+            ]},
+        })
+        diag = diagnose(results)
+        assert any(d["layer"] == "isp" and d["severity"] == "bad"
+                   and "first hops" in d["title"].lower() for d in diag)
+
     def test_bufferbloat_severe(self):
         results = _make_results({
             "bufferbloat": {"available": True, "ratio": 5.0, "rtt_idle_ms": 10, "rtt_loaded_ms": 50},

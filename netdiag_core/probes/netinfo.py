@@ -86,6 +86,70 @@ def get_default_interface():
     return None
 
 
+# Interface-name markers for VPN/tunnel devices. Deliberately excludes 'ppp'
+# (DSL PPPoE is a real WAN uplink, not a VPN) to avoid mislabeling DSL lines.
+_VPN_IFACE_RE = re.compile(
+    r"(tun|tap|wg|utun|wireguard|wintun|ipsec|nordlynx|proton|tailscale|mullvad|gpd|vpn)",
+    re.I)
+
+
+def _looks_like_tunnel(iface):
+    return bool(iface) and bool(_VPN_IFACE_RE.search(iface.strip()))
+
+
+def _sysfs_first_up_tunnel():
+    # Plan B (Linux, stdlib): a tunnel-named interface that is currently up.
+    # Tunnels frequently report operstate "unknown" while carrying, so accept it.
+    try:
+        for entry in sorted(Path("/sys/class/net").iterdir()):
+            if not _looks_like_tunnel(entry.name):
+                continue
+            try:
+                state = (entry / "operstate").read_text().strip()
+            except (OSError, IOError):
+                state = ""
+            if state in ("up", "unknown"):
+                return entry.name
+    except (OSError, IOError):
+        pass
+    return None
+
+
+def detect_vpn(probe_host="1.1.1.1"):
+    # Does public-internet traffic egress through a VPN/tunnel interface? This
+    # matters for diagnosis: under a VPN, traceroute hop 1 is the VPN server (not
+    # the local modem), and the tunnel commonly rate-limits ICMP, so MTR "loss"
+    # through it is NOT line loss. Returns {active, interface, kind}.
+    iface = None
+    if rt.IS_LINUX:
+        rc, out, _ = rt.run_cmd(["ip", "route", "get", probe_host], timeout=10)
+        if rc == 0:
+            m = re.search(r"\bdev\s+(\S+)", out)
+            if m:
+                iface = m.group(1)
+        # Only fall back to a sysfs scan when `ip` gave us nothing — trusting a
+        # real egress iface avoids a false positive on split-tunnel setups where
+        # this host bypasses an otherwise-up tunnel.
+        if iface is None:
+            iface = _sysfs_first_up_tunnel()
+    elif rt.IS_MACOS:
+        rc, out, _ = rt.run_cmd(["route", "-n", "get", probe_host], timeout=10)
+        if rc == 0:
+            m = re.search(r"interface:\s*(\S+)", out)
+            if m:
+                iface = m.group(1)
+    else:
+        rc, out, _ = rt.run_cmd(
+            ["powershell", "-NoProfile", "-Command",
+             "(Find-NetRoute -RemoteIPAddress %s | Select-Object -First 1).InterfaceAlias" % probe_host],
+            timeout=10)
+        if rc == 0 and out.strip():
+            iface = out.strip().splitlines()[-1].strip()
+    active = _looks_like_tunnel(iface)
+    return {"active": active, "interface": iface if active else None,
+            "kind": "vpn" if active else None}
+
+
 def detect_wireless_interface():
     if rt.IS_LINUX:
         if rt.has_tool("iw"):

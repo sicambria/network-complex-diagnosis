@@ -106,6 +106,19 @@ at a middle hop that clears by the destination is that router rate-limiting its
 own ICMP — only loss reaching the final hop is real. Watch the `(x or default)`
 trap: `failure_pct` of 0 is falsy, so use explicit `is None` checks.
 
+**MTR loss is also gated on the reconciliation and is VPN-aware** (`_diag_mtr`).
+Even loss that *reaches the destination* is NOT reported as real packet loss when
+TCP/HTTPS/DNS over the same path succeed (`transport_ok = dns_ok_global and
+(tcp_ok_global or http_ok_global)`) — it is the destination, or a VPN tunnel,
+rate-limiting echoes. And because `netinfo.detect_vpn()` (stored as
+`results["vpn"]`) reports whether public traffic egresses through a tunnel
+(`tun*/wg*/utun*/proton*/...`, excluding `ppp*` which is DSL), the engine knows
+traceroute "hop 1" under a VPN is the VPN server, not the modem — so it never
+emits the "restart your modem" verdict for tunnel ICMP loss. Without a VPN and
+without proven transport the original hop-1/ISP verdicts still fire. This closes
+the blind spot where a Proton/WireGuard tunnel's ICMP rate-limiting was
+misattributed to the customer's local uplink.
+
 ### Classification Thresholds (`classify_ping`)
 | Condition | Classification |
 |-----------|---------------|
