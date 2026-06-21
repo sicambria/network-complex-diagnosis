@@ -1,0 +1,29 @@
+    INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><title>NetDiag</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+<h1>NetDiag</h1>
+<nav>
+<button class="active" data-tab="dashboard">Dashboard</button>
+<button data-tab="troubleshoot">Troubleshoot</button>
+<button data-tab="monitor">Live Monitor</button>
+<button data-tab="history">History & Reports</button>
+<button data-tab="tools">Tools</button>
+<button data-tab="settings">Settings</button>
+<button data-tab="about">About</button>
+</nav>
+</header>
+<main>
+<!--PARTIALS-->
+</main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="/static/js/app1.js"></script>
+<script src="/static/js/app2.js"></script>
+<script src="/static/js/app3.js"></script>
+</body>
+</html>

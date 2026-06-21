@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Platform-agnostic internet diagnostics suite (`netdiag.py`) that isolates local network issues from ISP/upstream problems, detects WiFi signal problems, interface errors, bufferbloat, and per-hop routing issues. Single-file Python 3.12 script. CLI mode: stdlib only (zero deps). GUI mode: 2 optional pip deps (fastapi + uvicorn).
+Platform-agnostic internet diagnostics suite that isolates local network issues from ISP/upstream problems, detects WiFi signal problems, interface errors, bufferbloat, and per-hop routing issues. Runs from a checkout as the `netdiag_core/` Python package, with `netdiag.py` kept as a thin entry-and-re-export shim. Python 3.12+. CLI mode: stdlib only (zero deps). GUI mode: 2 optional pip deps (fastapi + uvicorn).
 
 Outputs machine-readable JSON + CSV in `internet_diagnostics/` and web GUI at `http://localhost:8080`.
 
@@ -22,41 +22,44 @@ Predecessor: `nettest.py` (1058 lines, Linux-only, simpler).
 
 ## Architecture
 
+Source lives in the `netdiag_core/` package; `netdiag.py` is a thin
+entry-and-re-export shim (`python3 netdiag.py ...` and `from netdiag import
+diagnose, full_diagnostic, ...` both still work). Every module is kept under 400
+lines. The dependency graph is acyclic. `docs/architecture.md` is the canonical,
+fuller description.
+
 ```
-netdiag.py (~3340 lines, single file)
-├── Platform detection      — IS_LINUX / IS_MACOS / IS_WINDOWS constants
-├── run_cmd() / has_tool()  — subprocess wrapper + tool detection
-├── ping()                  — platform-adaptive ping_command, parse_rtt_ms, ping_once, ping_burst
-├── percentile/series_stats — statistics helpers (percentile, series_stats, jitter_ms, clean_float)
-├── dns_test()              — socket.getaddrinfo() latency series
-├── tcp_test()              — socket.create_connection() latency series
-├── detect_gateway()        — ip route / route -n get / netstat -rn / procfs fallback
-├── get_default_interface() — ip route / route -n get
-├── detect_wireless_interface() — iw dev / airport / netsh wlan interface detection
-├── interface_stats()       — ip -s link / ifconfig / netstat -e / sysfs fallback
-├── wifi_info()             — iw survey dump / airport -I / netsh wlan / procfs fallback
-├── tcp_socket_stats()      — ss -itp / nettop -J / netstat -s / procfs fallback
-├── mtr_test()              — mtr -r / traceroute -n / tracert / native ping TTL sweep
-├── speedtest_result()      — Ookla speedtest / speedtest-cli
-├── iperf3_test()           — iperf3 -c server -t 10 -J
-├── bufferbloat_test()      — tc -s qdisc + iperf3 concurrent ping (Linux enhanced)
-├── ethtool_info()          — ethtool speed/duplex/link detection (Linux)
-├── download_images_test()  — HTTP download latency (image URLs over time)
-├── http_latency_test()     — HTTP request latency to multiple endpoints
-├── reliability_test()      — intermittent-connection detector: fresh cache-defeating HTTPS conns, per-phase timing (DNS/TCP/TLS/TTFB), first-vs-retry, IPv4/IPv6 + concurrency A/B, localized verdict (Plan B: urllib total-time). `label=` param namespaces its progress callbacks.
-├── wellknown_sites_test()  — intermittent-issue REPRODUCER: reliability_test pointed at ~100 WELLKNOWN_SITES favicons, ~2.5 min duration, IPv4, high concurrency (recreates "page with many small images"). wellknown_verdict() names worst-offending sites.
-├── reconcile_icmp()        — cross-references ICMP ping loss vs TCP/HTTP/DNS success to the SAME hosts; flags ICMP rate-limiting (1.1.1.1/8.8.8.8/9.9.9.9 etc.) so phantom "95% loss" is never reported as packet loss. Cached on results["icmp_reconciliation"]; get_reconciliation() reads-or-computes.
-├── mtu_probe()             — path MTU discovery via ping with varying packet size
-├── classify_ping()         — loss→bad_loss→some_loss→bad_latency_spikes→latency_spikes→high_jitter→clean (pure; the internet verdict routes through reconcile_icmp, not raw classify_ping)
-├── diagnose()              — 5-layer rule engine: physical→wifi→gateway→ISP→internet
-├── health_score()          — 0-100 composite from all layers (internet score ignores ICMP-filtered loss)
-├── full_diagnostic()       — orchestrates all probes in sequence
-├── write_report() / csv    — report.txt + diagnostics.json + CSVs
-├── build_isp_report()      — detailed plain-text evidence report for ISP tickets (isp_report.txt; export format=isp). Leads with the ICMP-vs-TCP method note; separates local vs upstream; side-by-side ICMP/TCP table.
-├── build_parser() / CLI    — argparse + default args (--wellknown-test, --isp-report)
-├── Server (FastAPI)         — /api/export/{file}?format=json|csv|html|isp + the run/stop/status/monitor/history routes
-└── Frontend (embedded HTML) — renders diagnose() output verbatim (Findings = interpretation, Measurements = raw values). NEVER recompute severity in JS — see "Single source of truth" below.
+netdiag.py                       — thin entry + re-export shim
+netdiag_core/
+├── constants.py                 — host lists, ICMP_RATE_LIMITERS, WELLKNOWN_SITES, RELIABILITY_TARGETS, VERSION
+├── runtime.py                   — IS_LINUX/IS_MACOS/IS_WINDOWS, run_cmd, has_tool, now_iso, activity log, package-manager detection, UserInterrupted
+├── stats.py                     — percentile, series_stats, jitter_ms, clean_float
+├── config.py                    — load/save config + session history (~/.netdiag/)
+├── probes/                      — one concern per module; each has Linux/macOS/Windows branches + stdlib Plan B
+│   ├── ping.py                  — ping_command, parse_rtt_ms, ping_once, ping_burst, resolve_all, classify_ping
+│   ├── netinfo.py               — gateway / default-interface / wireless-iface detection, interface_stats, sysfs+procfs fallbacks, ethtool_info
+│   ├── wifi.py                  — wifi_info (iw / airport / netsh) + /proc/net/wireless fallback
+│   ├── sockets.py               — tcp_socket_stats (ss / nettop / netstat) + /proc/net/tcp fallback
+│   ├── dns_tcp.py               — dns_test (getaddrinfo), tcp_test (create_connection)
+│   ├── route.py                 — mtr_test, traceroute/TTL fallbacks, mtu_probe
+│   ├── throughput.py            — speedtest_result, iperf3_test, bufferbloat_test
+│   └── reliability.py           — reliability_test (intermittent-connection detector, per-phase DNS/TCP/TLS/TTFB timing, first-vs-retry, IPv4/IPv6 + concurrency A/B; Plan B urllib total-time), wellknown_sites_test 100-site reproducer + verdict, HTTP/download probes
+├── analysis/                    — the severity authority
+│   ├── reconcile.py             — reconcile_icmp / get_reconciliation: ICMP loss vs TCP/HTTP/DNS success so rate-limiting is never reported as packet loss
+│   ├── diagnose.py              — diagnose(), the single source of truth for severity; engine concatenates per-layer helpers (physical→wifi→gateway→ISP→internet→meta)
+│   └── score.py                 — health_score() 0-100 weighted composite (internet score ignores ICMP-filtered loss)
+├── reporting.py                 — report.txt + diagnostics.json + CSVs, build_isp_report (isp_report.txt; export format=isp), console summary
+├── orchestrate.py               — full_diagnostic() sequences all probes + cooperative cancellation
+├── monitor.py                   — live-monitor sampling / state / verdict
+├── cli.py                       — build_parser (--wellknown-test, --isp-report, ...), cli_main
+├── server/                      — optional, lazy fastapi: build_app() assembles the FastAPI app + RunState and registers per-area route modules (routes_diag/monitor/reports/tools/config); /api/export/{file}?format=json|csv|html|isp + run/stop/status/monitor/history. page.py:assemble_index builds the page; /static is served from frontend/
+└── frontend/                    — static files (NOT an embedded Python string): index.html shell, partials/*.html (one per tab), styles.css, js/app1.js,app2.js,app3.js. Renders diagnose() output verbatim (Findings = interpretation, Measurements = raw values). NEVER recompute severity in JS — see "Single source of truth" below.
 ```
+
+The analysis layer keeps the same behavior as before — only the file locations
+moved: `classify_ping` is pure (`loss→bad_loss→some_loss→bad_latency_spikes→
+latency_spikes→high_jitter→clean`), and the internet verdict routes through
+`reconcile_icmp`, not raw `classify_ping`.
 
 ### Stop button / cooperative cancellation (GUI)
 A running diagnostic is a `daemon` thread — you cannot signal it from outside, so
@@ -218,6 +221,8 @@ tests/
 
 All tests use `unittest.mock` to avoid real subprocess/socket calls. Server tests skip if fastapi not installed.
 
+Patch the canonical module target, not `netdiag.X`. Internal callers use qualified module references (`rt.run_cmd(...)`, `netinfo.detect_gateway(...)`), so a symbol has exactly one patch home — its defining module (e.g. `netdiag_core.runtime.run_cmd`, `netdiag_core.probes.netinfo.detect_gateway`). The shim keeps `netdiag.X` *attribute access* working, but patching `netdiag.X` no longer affects internal call sites. See `docs/architecture.md` "Patch convention".
+
 **End-to-end**: `test_e2e.sh` — runs syntax checks, pytest, CLI diagnostic, GUI server test, install script validation, and uninstall script validation. Writes timestamped log to `/tmp/netdiag_e2e_*.log`.
 
 ## Makefile Targets
@@ -261,13 +266,18 @@ All tests use `unittest.mock` to avoid real subprocess/socket calls. Server test
   curl -s http://localhost:8080/api/reports | python3 -m json.tool
   ```
 
-- **Frontend changes**: After modifying `INDEX_HTML` in `netdiag.py`, delete `templates/index.html` and restart the server so it regenerates from source:
+- **Frontend changes**: The UI is now static files under `netdiag_core/frontend/`
+  (`index.html` shell, `partials/*.html` one per tab, `styles.css`,
+  `js/app1.js`/`app2.js`/`app3.js`). Edit those directly — the server assembles
+  `index.html` + partials at request time (`server/page.py:assemble_index`) and
+  serves `/static` from `netdiag_core/frontend`. There is no `INDEX_HTML` Python
+  string and no `templates/index.html` regeneration step anymore; just restart the
+  server to pick up changes:
   ```bash
-  rm -f templates/index.html
   pkill -f "netdiag.py.*--gui" 2>/dev/null; sleep 0.5   # scoped: never kill unrelated servers on :8080
   python3 netdiag.py --gui --port 8080 &
   sleep 2
-  curl -s http://localhost:8080/ | head -5  # verify fresh template served
+  curl -s http://localhost:8080/ | head -5  # verify the updated page is served
   ```
 
 ## Git Guardrails

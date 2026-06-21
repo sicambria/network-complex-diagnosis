@@ -1,0 +1,73 @@
+<div id="tab-monitor" class="tab-content">
+<div class="card">
+<h2>Live Monitor</h2>
+<p style="font-size:12px;color:var(--info);margin-bottom:12px">Move around with your laptop to see real-time signal changes, and watch a background sampler probe your gateway, the internet, DNS and TCP every second to catch intermittent issues. Refreshes every 1.5s.</p>
+<div class="live-controls">
+<button class="btn btn-orange" id="live-toggle-btn" onclick="toggleLiveMonitor()">Start Monitoring</button>
+<span class="live-timer" id="live-timer">00:00</span>
+</div>
+<div id="live-container" style="display:none">
+<div class="live-signal">
+<div class="live-signal-circle" id="live-circle">
+<span class="sig-value" id="live-sig-val">--</span>
+<span class="sig-unit">dBm</span>
+<span class="sig-label">WiFi Signal</span>
+</div>
+<span style="font-size:11px;color:var(--info);margin-top:6px" id="live-sig-text">Waiting...</span>
+<span style="font-size:14px;font-weight:600;margin-top:2px;color:var(--fg)" id="live-ssid">--</span>
+</div>
+<div class="live-stats">
+<div class="live-stat"><div class="value" id="live-latency">--</div><div class="label">Latency (ms)</div></div>
+<div class="live-stat"><div class="value" id="live-noise">--</div><div class="label">Noise (dBm)</div></div>
+<div class="live-stat"><div class="value" id="live-channel">--</div><div class="label">Channel Util %</div></div>
+<div class="live-stat"><div class="value" id="live-iface">--</div><div class="label">Interface</div></div>
+<div class="live-stat"><div class="value" id="live-ssid-stat">--</div><div class="label">Network</div></div>
+</div>
+<div class="live-chart">
+<canvas id="liveChart" height="160"></canvas>
+</div>
+<div class="live-health-bar">
+<span class="label">Live Health</span>
+<div class="bar"><div class="bar-inner" id="live-health-bar" style="width:50%"></div></div>
+<span class="val" id="live-health-val">--</span>
+</div>
+<div class="live-session-stats">
+<div class="stat-group">
+<div class="stat-title">Signal (dBm)</div>
+<div class="stat-row">
+<span>Avg: <b id="stat-sig-avg">--</b></span>
+<span>Med: <b id="stat-sig-med">--</b></span>
+<span>Min: <b id="stat-sig-min">--</b></span>
+<span>Max: <b id="stat-sig-max">--</b></span>
+</div>
+</div>
+<div class="stat-group">
+<div class="stat-title">Latency (ms)</div>
+<div class="stat-row">
+<span>Avg: <b id="stat-lat-avg">--</b></span>
+<span>Med: <b id="stat-lat-med">--</b></span>
+<span>Min: <b id="stat-lat-min">--</b></span>
+<span>Max: <b id="stat-lat-max">--</b></span>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div class="card" id="quality-card" style="display:none">
+<h2>Connection Quality (last 3 min)</h2>
+<p style="font-size:12px;color:var(--info);margin-bottom:4px">Probing your gateway, two external hosts, DNS and TCP separately so a problem in one layer doesn't hide behind a healthy result in another.</p>
+<table class="quality-table">
+<thead><tr><th>Target</th><th>Loss %</th><th>Avg ms</th><th>Jitter ms</th><th>p95 ms</th><th>Samples</th></tr></thead>
+<tbody id="quality-tbody"></tbody>
+</table>
+<div id="hint-list" class="hint-list"></div>
+</div>
+
+<div class="card" id="events-card" style="display:none">
+<h2>Outage / Loss Events</h2>
+<p style="font-size:12px;color:var(--info);margin-bottom:4px">Each entry is a streak of consecutive failed probes against one target.</p>
+<div id="event-list" class="event-list"><div class="empty-note">No events recorded yet.</div></div>
+</div>
+</div>
+

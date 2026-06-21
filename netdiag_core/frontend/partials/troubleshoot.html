@@ -1,0 +1,42 @@
+<div id="tab-troubleshoot" class="tab-content">
+<div class="card">
+<h2>Network Diagnostic</h2>
+<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+<button class="btn" id="run-btn" onclick="runDiagnostic()">Run Full Diagnostic</button>
+<button class="btn btn-danger" id="stop-btn" onclick="stopDiagnostic()" style="display:none">Stop</button>
+<span id="run-status" style="font-size:12px;color:var(--info)"></span>
+</div>
+<div class="options-toggle" onclick="toggleOptions()">&#x25B6; Options</div>
+<div class="options-panel" id="options-panel">
+<div class="option-row"><input type="checkbox" id="opt-speedtest" checked><label for="opt-speedtest">Speed test</label></div>
+<div class="option-row"><input type="checkbox" id="opt-download"><label for="opt-download">Download test (100 images)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-connection"><label for="opt-connection">Connection testing (HTTP latency + MTU)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-reliability"><label for="opt-reliability">Reliability test (intermittent / first-connect-fails)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-wellknown"><label for="opt-wellknown">Intermittent reproduction &mdash; 100 well-known sites, ~2.5 min</label></div>
+<div class="option-row"><input type="checkbox" id="opt-trace" checked><label for="opt-trace">Route trace (MTR)</label></div>
+<div class="option-row"><input type="checkbox" id="opt-bufferbloat" checked><label for="opt-bufferbloat">Bufferbloat test</label></div>
+<div class="option-row"><input type="checkbox" id="opt-iperf3"><label for="opt-iperf3">iPerf3 throughput</label></div>
+</div>
+<div id="progress-container" style="display:none">
+<div class="progress-bar"><div class="progress-bar-fill" id="progress-fill" style="width:0%"></div></div>
+<div style="font-size:11px;color:var(--info)" id="progress-label"></div>
+</div>
+<div id="log-output"></div>
+<div id="prog-list" style="margin-top:8px;max-height:300px;overflow-y:auto;display:none"></div>
+<div id="health-live" class="health-live" style="display:none">
+  <span class="health-live-label">Live Health</span>
+  <div class="health-bar-outer"><div class="health-bar-inner" id="health-bar-inner" style="width:0%"></div></div>
+  <span class="health-live-val" id="health-live-val">--</span>
+</div>
+</div>
+<div class="card" id="stack-card" style="display:none">
+<h2>Network Stack</h2>
+<div id="stack-layers"></div>
+</div>
+<div class="card">
+<h2>Under the Hood</h2>
+<p style="font-size:12px;color:var(--info);margin-bottom:4px">Commands and probes NetDiag has actually run, most recent first.</p>
+<div id="activity-list" class="activity-list"><div class="empty-note">No activity yet.</div></div>
+</div>
+</div>
+

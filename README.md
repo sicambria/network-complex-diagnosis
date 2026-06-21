@@ -1,6 +1,6 @@
 # NetDiag
 
-All-in-one internet diagnostics suite. Single-file Python 3.12+, zero deps for CLI mode.
+All-in-one internet diagnostics suite. Python 3.12+, zero deps for CLI mode.
 
 Detects WiFi signal problems, interface errors, bufferbloat, per-hop routing issues, and isolates local vs ISP problems.
 
@@ -79,20 +79,30 @@ python3 netdiag.py --gui
 
 ## Architecture
 
+NetDiag runs from a checkout as the `netdiag_core/` Python package, with
+`netdiag.py` kept as a thin entry-and-re-export shim (`python3 netdiag.py ...`
+and `from netdiag import diagnose` both still work). Every module is under 400
+lines. See `docs/architecture.md` for the full breakdown.
+
 ```
-netdiag.py
-├── Platform detection    — Linux / macOS / Windows branches
-├── 16 probe wrappers     — ping, tcp, dns, mtr, iperf3, speedtest, traceroute,
-│                           bufferbloat, interface_stats, wifi_info, tcp_socket_stats,
-│                           ethtool, download_test, http_latency, mtu_probe
-├── Plan B fallbacks      — Every probe degrades to stdlib (procfs, socket) when CLI missing
-├── Diagnosis engine      — 5 layers: physical → wifi → gateway → ISP → internet
-├── Health scorer         — weighted composite 0–100 with 7 layers + download/http
-├── CLI entry point       — argparse, file output, console summary
-├── FastAPI server        — 19 API routes + embedded frontend
-├── Live monitor          — continuous multi-target sampler at ~1 Hz
-├── Tool menu             — OSI-layer-organized tool catalog (GUI Tools tab)
-└── Embedded frontend     — HTML/CSS/JS SPA (Chart.js)
+netdiag.py                — thin entry + re-export shim
+netdiag_core/
+├── constants.py          — host lists, ICMP_RATE_LIMITERS, WELLKNOWN_SITES, VERSION
+├── runtime.py            — platform flags, run_cmd, has_tool, activity log, UserInterrupted
+├── stats.py              — percentile, series_stats, jitter_ms, clean_float
+├── config.py             — config + session-history persistence
+├── probes/               — one concern per module, each with Plan B stdlib fallback
+│                           (ping, netinfo, wifi, sockets, dns_tcp, route,
+│                            throughput, reliability)
+├── analysis/             — severity authority: reconcile.py (ICMP-vs-TCP),
+│                           diagnose.py (single source of truth), score.py
+├── reporting.py          — report.txt, CSV, build_isp_report, console summary
+├── orchestrate.py        — full_diagnostic() sequencing + cooperative cancellation
+├── monitor.py            — live-monitor sampling/state/verdict
+├── cli.py                — build_parser, cli_main
+├── server/               — optional, lazy fastapi (build_app + per-area route modules)
+└── frontend/             — static files: index.html shell, partials/*.html,
+                            styles.css, js/*.js (assembled server-side, no template step)
 
 Platform scoring: Linux 93/100, macOS 82/100, Windows 74/100
 ```

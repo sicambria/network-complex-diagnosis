@@ -5,45 +5,45 @@ from netdiag import detect_wireless_interface, _sysfs_interface_stats, wifi_info
 
 class TestDetectWirelessInterface:
     def test_linux_iw_returns_interface(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=True), \
-             patch("netdiag.run_cmd", return_value=(0, "Interface wlan0\n", "")):
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(0, "Interface wlan0\n", "")):
             assert detect_wireless_interface() == "wlan0"
 
     def test_linux_iw_fails_fallback_procfs(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=True), \
-             patch("netdiag.run_cmd", return_value=(1, "", "error")), \
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(1, "", "error")), \
              patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.read_text", return_value="header1\nheader2\n wlan0: 0 0 0 0 0 0 0 0 0 0 0 0\n"):
             assert detect_wireless_interface() == "wlan0"
 
     def test_linux_no_iw_fallback_procfs(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=False), \
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=False), \
              patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.read_text", return_value="header1\nheader2\n wlan0: 0 0 0 0 0 0 0 0 0 0 0 0\n"):
             assert detect_wireless_interface() == "wlan0"
 
     def test_linux_neither_returns_none(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=False), \
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=False), \
              patch("pathlib.Path.exists", return_value=False):
             assert detect_wireless_interface() is None
 
     def test_macos_returns_default_interface(self):
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", True), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.get_default_interface", return_value="en0"):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", True), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.probes.netinfo.get_default_interface", return_value="en0"):
             assert detect_wireless_interface() == "en0"
 
     def test_windows_netsh_finds_name(self):
@@ -51,17 +51,17 @@ class TestDetectWirelessInterface:
             "Name                   : Wi-Fi\n"
             "SSID                   : MyNetwork\n"
         )
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", True), \
-             patch("netdiag.run_cmd", return_value=(0, netsh_out, "")):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(0, netsh_out, "")):
             assert detect_wireless_interface() == "Wi-Fi"
 
     def test_windows_netsh_failure(self):
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", True), \
-             patch("netdiag.run_cmd", return_value=(1, "", "error")):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(1, "", "error")):
             assert detect_wireless_interface() is None
 
 
@@ -135,11 +135,11 @@ class TestWifiInfo:
     def test_linux_iw_parses_link_output(self):
         link_out = "SSID: HomeNetwork\nsignal: -45\nfreq: 5180\n"
         survey_out = ""
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=True), \
-             patch("netdiag.run_cmd", side_effect=[
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=True), \
+             patch("netdiag_core.runtime.run_cmd", side_effect=[
                  (0, link_out, ""),
                  (0, survey_out, ""),
              ]):
@@ -157,11 +157,11 @@ class TestWifiInfo:
             "channel active time: 1000  busy time: 300\n"
             " noise: -90\n"
         )
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=True), \
-             patch("netdiag.run_cmd", side_effect=[
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=True), \
+             patch("netdiag_core.runtime.run_cmd", side_effect=[
                  (0, link_out, ""),
                  (0, survey_out, ""),
              ]):
@@ -170,12 +170,12 @@ class TestWifiInfo:
             assert result["noise_dbm"] == -90
 
     def test_linux_iw_fails_fallback_proc_net_wireless(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=True), \
-             patch("netdiag.run_cmd", return_value=(1, "", "error")), \
-             patch("netdiag._proc_net_wireless", return_value={
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(1, "", "error")), \
+             patch("netdiag_core.probes.wifi._proc_net_wireless", return_value={
                  "available": True, "interface": "wlan0",
                  "ssid": None, "signal_dbm": -50, "noise_dbm": -95,
                  "frequency": None, "tx_retries": None, "channel_util": None,
@@ -186,22 +186,22 @@ class TestWifiInfo:
             assert result["noise_dbm"] == -95
 
     def test_linux_both_fail_returns_unavailable(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=True), \
-             patch("netdiag.run_cmd", return_value=(1, "", "error")), \
-             patch("netdiag._proc_net_wireless", return_value=None):
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(1, "", "error")), \
+             patch("netdiag_core.probes.wifi._proc_net_wireless", return_value=None):
             result = wifi_info("wlan0")
             assert result["available"] is False
             assert "iw not available" in result["reason"]
 
     def test_linux_no_iw_both_fail_returns_unavailable(self):
-        with patch("netdiag.IS_LINUX", True), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.has_tool", return_value=False), \
-             patch("netdiag._proc_net_wireless", return_value=None):
+        with patch("netdiag_core.runtime.IS_LINUX", True), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.has_tool", return_value=False), \
+             patch("netdiag_core.probes.wifi._proc_net_wireless", return_value=None):
             result = wifi_info("wlan0")
             assert result["available"] is False
             assert "/proc/net/wireless not found" in result["reason"]
@@ -212,10 +212,10 @@ class TestWifiInfo:
             "  agrCtlRSSI: -55\n"
             " agrCtlNoise: -92\n"
         )
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", True), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.run_cmd", return_value=(0, airport_out, "")):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", True), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(0, airport_out, "")):
             result = wifi_info("en0")
             assert result["available"] is True
             assert result["interface"] == "en0"
@@ -224,10 +224,10 @@ class TestWifiInfo:
             assert result["noise_dbm"] == -92
 
     def test_macos_airport_failure(self):
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", True), \
-             patch("netdiag.IS_WINDOWS", False), \
-             patch("netdiag.run_cmd", return_value=(1, "", "error")):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", True), \
+             patch("netdiag_core.runtime.IS_WINDOWS", False), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(1, "", "error")):
             result = wifi_info("en0")
             assert result["available"] is False
             assert result["reason"] == "airport command failed"
@@ -238,10 +238,10 @@ class TestWifiInfo:
             "SSID                   : CoffeeShop\n"
             "Signal                 : 75%\n"
         )
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", True), \
-             patch("netdiag.run_cmd", return_value=(0, netsh_out, "")):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(0, netsh_out, "")):
             result = wifi_info("Wi-Fi")
             assert result["available"] is True
             assert result["interface"] == "Wi-Fi"
@@ -249,10 +249,10 @@ class TestWifiInfo:
             assert result["signal_dbm"] == -25
 
     def test_windows_netsh_failure(self):
-        with patch("netdiag.IS_LINUX", False), \
-             patch("netdiag.IS_MACOS", False), \
-             patch("netdiag.IS_WINDOWS", True), \
-             patch("netdiag.run_cmd", return_value=(1, "", "error")):
+        with patch("netdiag_core.runtime.IS_LINUX", False), \
+             patch("netdiag_core.runtime.IS_MACOS", False), \
+             patch("netdiag_core.runtime.IS_WINDOWS", True), \
+             patch("netdiag_core.runtime.run_cmd", return_value=(1, "", "error")):
             result = wifi_info("Wi-Fi")
             assert result["available"] is False
             assert result["reason"] == "netsh wlan failed"

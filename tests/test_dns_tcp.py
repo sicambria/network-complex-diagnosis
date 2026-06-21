@@ -8,7 +8,7 @@ from netdiag import dns_test, tcp_test, _tcp_ping
 
 class TestDnsTest:
     def test_dns_success(self):
-        with patch("netdiag.resolve_all") as mock_resolve:
+        with patch("netdiag_core.probes.ping.resolve_all") as mock_resolve:
             mock_resolve.return_value = {
                 "ok": True,
                 "addresses": [{"ip": "1.1.1.1", "version": 4}],
@@ -21,7 +21,7 @@ class TestDnsTest:
             assert len(result["addresses"]) == 1
 
     def test_dns_all_fail(self):
-        with patch("netdiag.resolve_all") as mock_resolve:
+        with patch("netdiag_core.probes.ping.resolve_all") as mock_resolve:
             mock_resolve.return_value = {"ok": False, "addresses": []}
             result = dns_test("bad.example", count=5)
             assert result["failures"] == 5
@@ -38,13 +38,13 @@ class TestDnsTest:
         def side_effect(*a, **kw):
             return returns.pop(0) if returns else {"ok": False, "addresses": []}
 
-        with patch("netdiag.resolve_all", side_effect=side_effect):
+        with patch("netdiag_core.probes.ping.resolve_all", side_effect=side_effect):
             result = dns_test("test.example", count=3)
             assert result["failures"] == 1
             assert result["failure_pct"] == pytest.approx(100 / 3, 0.01)
 
     def test_dns_deduplicates_addresses(self):
-        with patch("netdiag.resolve_all") as mock_resolve:
+        with patch("netdiag_core.probes.ping.resolve_all") as mock_resolve:
             mock_resolve.return_value = {
                 "ok": True,
                 "addresses": [

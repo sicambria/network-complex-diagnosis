@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-See @AGENTS.md for the full project guide: architecture of `netdiag.py` (single ~3340-line file), code conventions, commands, workflow rules (server restart / frontend regeneration procedures), and no-go rules. Follow it strictly — especially:
+See @AGENTS.md for the full project guide: the `netdiag_core/` package architecture (with `netdiag.py` as a thin entry-and-re-export shim; every module under 400 lines — see `docs/architecture.md` for the canonical layout), code conventions, commands, workflow rules (server restart; the frontend is now static files under `netdiag_core/frontend/`, edited directly with no regeneration step), and no-go rules. Follow it strictly — especially:
 
 - CLI core is stdlib-only (Python 3.12+); fastapi/uvicorn are optional and only for GUI mode. Never add other pip dependencies.
 - No type hints, no docstrings; functions return plain dicts.

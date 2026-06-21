@@ -60,7 +60,8 @@ test:
 	$(PYTHON) -m pytest tests/ -v $(ARGS)
 
 lint:
-	$(PYTHON) -c "import py_compile; py_compile.compile('$(SCRIPT)', doraise=True)" && echo "Syntax OK"
+	$(PYTHON) -c "import py_compile; py_compile.compile('$(SCRIPT)', doraise=True)"
+	$(PYTHON) -m compileall -q netdiag_core && echo "Syntax OK"
 
 run:
 	$(PYTHON) $(SCRIPT)

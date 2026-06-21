@@ -189,19 +189,19 @@ Question: Is the internet unstable?
 
 ## Implemented Solution: netdiag.py
 
-The research above informed the architecture of `netdiag.py` (1833 lines), which is now the primary codebase. It achieves **93/100** on Linux through platform-aware tool wrapping, a 5-layer diagnosis engine, and an interactive web GUI.
+The research above informed the architecture of the `netdiag_core/` package (entered via the `netdiag.py` shim), which is now the primary codebase. It achieves **93/100** on Linux through platform-aware tool wrapping, a 5-layer diagnosis engine, and an interactive web GUI.
 
 ### Architecture
 
 ```
-netdiag.py (1833 lines, single file)
+netdiag_core/ package (netdiag.py thin entry shim; every module < 400 lines)
 ├── Platform detection — IS_LINUX / IS_MACOS / IS_WINDOWS
 ├── 12 probe wrappers — ping, mtr, iperf3, ss, ip, iw, tc, ethtool, speedtest, dns, tcp
 ├── 5-layer diagnosis engine — physical → wifi → gateway → ISP → internet
 ├── Health scoring 0-100 — weighted composite
 ├── CLI mode — stdlib only (same zero-deps as nettest.py)
 ├── FastAPI server — /api/run, /api/status, /api/history, /api/session/, /api/export/
-└── Frontend — Single HTML SPA with Chart.js, Dashboard + Troubleshoot + History + Reports
+└── Frontend — HTML SPA with Chart.js (static files), Dashboard + Troubleshoot + History + Reports
 ```
 
 ### Scoring (netdiag.py)
@@ -216,7 +216,7 @@ netdiag.py (1833 lines, single file)
 
 1. **Zero deps for CLI** — stdlib only, same as nettest.py
 2. **Optional GUI** — `pip install fastapi uvicorn` enables web UI
-3. **Single file** — all logic in netdiag.py, frontend embedded as template
+3. **Package architecture** — logic organized as the `netdiag_core/` package (every module < 400 lines) behind a thin `netdiag.py` shim; frontend served as static files
 4. **Graceful degradation** — unavailable probes are greyed out, diagnosis adapts
 5. **Cross-layer correlation** — WiFi signal dips + gateway spikes = WiFi issue, not router
 6. **Historical persistence** — JSON sessions in ~/.netdiag/ for trend analysis

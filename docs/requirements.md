@@ -2,7 +2,7 @@
 
 ## Overview
 
-NetDiag is a platform-agnostic, single-file internet diagnostics suite that isolates local network issues from ISP/upstream problems. It provides a 5-layer rule-based diagnosis engine, health scoring, CLI output, JSON/CSV export, and an optional web GUI.
+NetDiag is a platform-agnostic internet diagnostics suite that isolates local network issues from ISP/upstream problems. It runs from a checkout as the `netdiag_core/` Python package (with `netdiag.py` as a thin entry shim) and provides a 5-layer rule-based diagnosis engine, health scoring, CLI output, JSON/CSV export, and an optional web GUI.
 
 ---
 
@@ -196,8 +196,8 @@ The system shall support `--quiet` mode that suppresses per-ping progress output
 
 When started with `--gui`, the system shall:
 - Serve a FastAPI web application on the configured port (default 8080)
-- Embed a single-page HTML frontend with Chart.js for visualization
-- Auto-regenerate `templates/index.html` from the embedded template on startup
+- Serve a single-page HTML frontend with Chart.js for visualization
+- Assemble the page from static files in `netdiag_core/frontend/` (`index.html` shell + per-tab `partials/*.html`) at request time, serving `/static` from that directory
 
 ### REQ-024: GUI API Routes
 
@@ -290,9 +290,9 @@ The CLI mode shall use only Python 3.12+ standard library modules. No `pip insta
 
 The web GUI mode shall require only `fastapi` and `uvicorn`, installed via `pip install fastapi uvicorn`.
 
-### NFR-003: Single File
+### NFR-003: Package Architecture
 
-All logic (probes, diagnosis, health score, CLI, web server, frontend) shall reside in a single `netdiag.py` file.
+The implementation shall be organized as the `netdiag_core/` Python package (constants, runtime, stats, config, probes, analysis, reporting, orchestrate, monitor, cli, server, frontend), with each module kept under 400 lines and `netdiag.py` retained as a thin entry-and-re-export shim. The CLI core shall remain standard-library-only.
 
 ### NFR-004: Platform Support
 

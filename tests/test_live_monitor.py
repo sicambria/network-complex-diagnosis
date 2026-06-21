@@ -63,9 +63,9 @@ class TestMonitorSample:
             "tcp_host": "1.1.1.1",
             "tcp_port": 443,
         }
-        with patch("netdiag.ping_once") as mock_ping, \
-                patch("netdiag.resolve_all") as mock_resolve, \
-                patch("netdiag._tcp_ping") as mock_tcp:
+        with patch("netdiag_core.probes.ping.ping_once") as mock_ping, \
+                patch("netdiag_core.probes.ping.resolve_all") as mock_resolve, \
+                patch("netdiag_core.probes.ping._tcp_ping") as mock_tcp:
             mock_ping.return_value = {"ok": True, "rtt_ms": 5.0, "rc": 0}
             mock_resolve.return_value = {"ok": True, "addresses": []}
             mock_tcp.return_value = {"ok": True, "rtt_ms": 10.0}
@@ -87,9 +87,9 @@ class TestMonitorSample:
             "tcp_host": "1.1.1.1",
             "tcp_port": 443,
         }
-        with patch("netdiag.ping_once") as mock_ping, \
-                patch("netdiag.resolve_all") as mock_resolve, \
-                patch("netdiag._tcp_ping") as mock_tcp:
+        with patch("netdiag_core.probes.ping.ping_once") as mock_ping, \
+                patch("netdiag_core.probes.ping.resolve_all") as mock_resolve, \
+                patch("netdiag_core.probes.ping._tcp_ping") as mock_tcp:
             mock_ping.return_value = {"ok": False, "rtt_ms": None, "rc": 1}
             mock_resolve.return_value = {"ok": False, "addresses": []}
             mock_tcp.return_value = {"ok": False, "rtt_ms": None}

@@ -1,0 +1,34 @@
+<div id="tab-dashboard" class="tab-content active">
+<div style="text-align:center;margin-bottom:24px">
+<button class="btn btn-orange" id="dash-run-btn" onclick="dashRunDiag()">Start Diagnosis</button>
+<span id="dash-run-status" style="margin-left:12px;font-size:13px;color:var(--info)"></span>
+</div>
+<div id="dash-progress" style="display:none">
+<div class="progress-bar"><div class="progress-bar-fill" id="dash-progress-fill" style="width:0%"></div></div>
+<div style="font-size:11px;color:var(--info);text-align:center;margin-top:4px" id="dash-progress-label"></div>
+</div>
+<div class="metrics">
+<div class="metric">
+<div class="value" id="health-val">--</div>
+<div class="label">Health Score</div>
+</div>
+<div class="metric">
+<div class="value" id="sig-val">--</div>
+<div class="label">WiFi Signal</div>
+</div>
+<div class="metric">
+<div class="value" id="gw-val">--</div>
+<div class="label">Gateway Latency</div>
+</div>
+<div class="metric">
+<div class="value" id="spd-val">--</div>
+<div class="label">Speed</div>
+</div>
+</div>
+<div class="card">
+<h2>Connection Health</h2>
+<canvas id="scoreChart" width="240" height="120" style="max-height:120px"></canvas>
+<div id="events-list"></div>
+</div>
+</div>
+

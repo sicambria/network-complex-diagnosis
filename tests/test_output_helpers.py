@@ -221,8 +221,8 @@ class TestWriteCsv:
 
 
 class TestDiagArgsFromKw:
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_returns_object_with_expected_attributes(self, mock_load_config):
         mock_load_config.return_value = {
             "hosts": ["1.1.1.1", "8.8.8.8"],
@@ -241,17 +241,17 @@ class TestDiagArgsFromKw:
         assert a.outdir == "internet_diagnostics"
         assert a.history_dir == "~/.netdiag"
 
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_string_hosts_split_by_comma(self, mock_load_config):
         mock_load_config.return_value = {}
         a = _diag_args_from_kw({"hosts": "1.1.1.1,8.8.8.8, google.com"})
         assert a.hosts == ["1.1.1.1", "8.8.8.8", "google.com"]
 
-    @patch("netdiag.load_config")
+    @patch("netdiag_core.config.load_config")
     def test_boolean_flags_set_correctly(self, mock_load_config):
         mock_load_config.return_value = {}
-        with patch("netdiag.IS_LINUX", True):
+        with patch("netdiag_core.runtime.IS_LINUX", True):
             a = _diag_args_from_kw({"bufferbloat": False})
             assert a.no_bufferbloat is True
             a = _diag_args_from_kw({"bufferbloat": True})
@@ -259,16 +259,16 @@ class TestDiagArgsFromKw:
             a = _diag_args_from_kw({})
             assert a.no_bufferbloat is False
 
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_no_bufferbloat_true_on_non_linux(self, mock_load_config):
         mock_load_config.return_value = {}
-        with patch("netdiag.IS_LINUX", False):
+        with patch("netdiag_core.runtime.IS_LINUX", False):
             a = _diag_args_from_kw({"bufferbloat": True})
             assert a.no_bufferbloat is True
 
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_speedtest_iperf_flags(self, mock_load_config):
         mock_load_config.return_value = {}
         a = _diag_args_from_kw({})
@@ -278,8 +278,8 @@ class TestDiagArgsFromKw:
         assert a.no_speedtest is False
         assert a.no_iperf is False
 
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_no_trace_and_download_connection_flags(self, mock_load_config):
         mock_load_config.return_value = {}
         a = _diag_args_from_kw({})
@@ -291,8 +291,8 @@ class TestDiagArgsFromKw:
         assert a.download_test is True
         assert a.connection_test is True
 
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_numeric_parameters_parsed_correctly(self, mock_load_config):
         mock_load_config.return_value = {}
         a = _diag_args_from_kw({
@@ -305,8 +305,8 @@ class TestDiagArgsFromKw:
         assert a.dns_count == 3
         assert a.tcp_count == 7
 
-    @patch("netdiag.load_config")
-    @patch("netdiag.IS_LINUX", True)
+    @patch("netdiag_core.config.load_config")
+    @patch("netdiag_core.runtime.IS_LINUX", True)
     def test_uses_load_config_for_defaults(self, mock_load_config):
         mock_load_config.return_value = {
             "ping_count": 50,
