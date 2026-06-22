@@ -57,31 +57,45 @@ def start_server(args):
 
     if args.daemon:
         diag_args = parser().parse_args([])
-        if not rt.IS_LINUX:
-            diag_args.no_bufferbloat = True
+        # The daemon re-runs this every 10 min, so it must use only fast,
+        # self-contained probes. The heavy ones (speedtest/iperf3/bufferbloat/mtr)
+        # reach out to public servers that routinely hang with no hard timeout — a
+        # single stuck iperf3 wedges the loop so history never persists (the bug
+        # this fixes). They add nothing to a rolling trend; deep runs stay on-demand
+        # via the CLI / Tools tab.
+        diag_args.no_speedtest = True
+        diag_args.no_iperf = True
+        diag_args.no_bufferbloat = True
+        diag_args.no_trace = True
 
         def daemon_loop(diag_args, current_run):
             while True:
-                with current_run.get("_lock", threading.Lock()):
-                    if current_run.get("status") != "running":
+                # Claim the run under the lock, then RELEASE it before the long
+                # diagnostic. Holding it across full_diagnostic deadlocks: the
+                # progress callback below re-acquires the same (non-reentrant) lock
+                # on the first probe, so the loop would wedge forever and never
+                # persist history. Only the quick state mutations take the lock.
+                with current_run["_lock"]:
+                    busy = current_run.get("status") == "running"
+                    if not busy:
                         current_run["status"] = "running"
                         current_run["progress"] = {}
+                if not busy:
+                    def cb(label, seq, total, ok, rtt, status_override=None):
+                        st2 = status_override or ("running" if seq < total else "done")
+                        with current_run["_lock"]:
+                            current_run["progress"][label] = {"seq": seq, "total": total, "ok": ok, "rtt_ms": rtt, "status": st2}
 
-                        def cb(label, seq, total, ok, rtt, status_override=None):
-                            st2 = status_override or ("running" if seq < total else "done")
-                            with current_run.get("_lock", threading.Lock()):
-                                current_run["progress"][label] = {"seq": seq, "total": total, "ok": ok, "rtt_ms": rtt, "status": st2}
-
-                        try:
-                            res = orchestrate.full_diagnostic(diag_args, callback=cb)
-                            with current_run.get("_lock", threading.Lock()):
-                                current_run["status"] = "done"
-                                current_run["results"] = res
-                                config.save_history(diag_args.history_dir, res)
-                        except Exception as e:
-                            with current_run.get("_lock", threading.Lock()):
-                                current_run["status"] = "error"
-                                current_run["error"] = str(e)
+                    try:
+                        res = orchestrate.full_diagnostic(diag_args, callback=cb)
+                        with current_run["_lock"]:
+                            current_run["status"] = "done"
+                            current_run["results"] = res
+                            config.save_history(diag_args.history_dir, res)
+                    except Exception as e:
+                        with current_run["_lock"]:
+                            current_run["status"] = "error"
+                            current_run["error"] = str(e)
                 time.sleep(600)
 
         current_run["_lock"] = threading.Lock()
