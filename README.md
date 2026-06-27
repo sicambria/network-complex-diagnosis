@@ -1,5 +1,11 @@
 # NetDiag
 
+[![CI](https://github.com/sicambria/network-complex-diagnosis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sicambria/network-complex-diagnosis/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#)
+[![CLI deps: zero](https://img.shields.io/badge/CLI%20deps-zero-brightgreen.svg)](#)
+
 All-in-one internet diagnostics suite. Python 3.12+, zero deps for CLI mode.
 
 Detects WiFi signal problems, interface errors, bufferbloat, per-hop routing issues, and isolates local vs ISP problems.
