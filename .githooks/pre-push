@@ -63,12 +63,57 @@ fi
 
 echo -e "${YELLOW}[PRE-PUSH] Running test suite...${NC}"
 cd "$SCRIPT_DIR"
-python3 -m pytest tests/ -x --tb=short -q 2>&1 | tail -20
-PYTEST_EXIT=${PIPESTATUS[0]}
+
+# Test deps (fastapi/uvicorn/httpx/pytest) are PEP-668-blocked system-wide and
+# live in .venv. Using bare `python3` here silently SKIPS every server/e2e test
+# (no fastapi/httpx import), so the suite looked green while ~half of it never
+# ran. Prefer the venv interpreter; refuse to push on the partial system suite.
+VENV_PY="$SCRIPT_DIR/.venv/bin/python"
+if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import fastapi, uvicorn, httpx, pytest" 2>/dev/null; then
+    PYTEST_PY="$VENV_PY"
+else
+    echo -e "${RED}[PRE-PUSH] .venv with test deps not found.${NC}"
+    echo -e "${YELLOW}Run 'make venv' (or 'make dev-setup') so the full suite can run, then push again.${NC}"
+    exit 1
+fi
+
+# Run the COMPLETE non-browser suite (no -x: report every failure, not just the
+# first). The Playwright browser e2e is excluded — it needs a provisioned
+# chromium and is reserved for 'make test-all'. Capture output so we can both
+# show it and audit the summary for a hollow run (set +e: don't let the non-zero
+# pytest exit trip `set -e` before we inspect it).
+set +e
+PYTEST_OUT="$("$PYTEST_PY" -m pytest tests/ --ignore=tests/test_e2e_browser.py --tb=short -q 2>&1)"
+PYTEST_EXIT=$?
+set -e
+echo "$PYTEST_OUT" | tail -25
 
 if [ "$PYTEST_EXIT" -ne 0 ]; then
     echo -e "${RED}[PRE-PUSH] Some tests failed (exit code $PYTEST_EXIT). Push rejected.${NC}"
     exit 1
 fi
 
-echo -e "\e[32m[PRE-PUSH] All tests passed.\e[0m"
+# Defense-in-depth against a HOLLOW gate (the bug this hook just fixed): a green
+# exit code is not enough — a missing dep or broken conftest can make pytest pass
+# while mass-SKIPPING or never collecting most tests. Audit the summary line.
+SUMMARY="$(echo "$PYTEST_OUT" | grep -E '[0-9]+ (passed|skipped|deselected)' | tail -1)"
+PASSED="$(echo "$SUMMARY"  | grep -oE '[0-9]+ passed'  | grep -oE '[0-9]+' || echo 0)"
+SKIPPED="$(echo "$SUMMARY" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)"
+PASSED=${PASSED:-0}; SKIPPED=${SKIPPED:-0}
+
+# Floors/ceilings are deliberately slack — they trip only on a GROSS regression
+# (interpreter/dep/collection breakage), not on adding or removing a few tests.
+MIN_PASSED=600   # full venv suite is ~682; well below that means the suite didn't really run
+MAX_SKIPPED=25   # normal is ~2 (platform-only tests); a flood means deps are missing
+if [ "$PASSED" -lt "$MIN_PASSED" ]; then
+    echo -e "${RED}[PRE-PUSH] Only ${PASSED} tests passed (expected >= ${MIN_PASSED}).${NC}"
+    echo -e "${YELLOW}The suite did not run in full — likely a missing dep or collection error. Push rejected.${NC}"
+    exit 1
+fi
+if [ "$SKIPPED" -gt "$MAX_SKIPPED" ]; then
+    echo -e "${RED}[PRE-PUSH] ${SKIPPED} tests skipped (expected <= ${MAX_SKIPPED}).${NC}"
+    echo -e "${YELLOW}A mass-skip means test deps are missing and the gate is hollow. Push rejected.${NC}"
+    exit 1
+fi
+
+echo -e "\e[32m[PRE-PUSH] All tests passed (${PASSED} passed, ${SKIPPED} skipped).\e[0m"

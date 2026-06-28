@@ -354,6 +354,16 @@ Pre-commit and pre-push hooks in `.githooks/` block commits containing:
 
 The hooks are auto-activated via `git config core.hooksPath .githooks` (set globally or per-repo).
 
+**Pre-push runs the FULL suite via `.venv/bin/python`, never bare `python3`.**
+Test deps (fastapi/uvicorn/httpx/pytest) are PEP-668-blocked system-wide and
+live in `.venv`. A bare `python3 -m pytest` either errors (`No module named
+pytest`) or, where system pytest exists, silently SKIPS every server/e2e test
+because the fastapi/httpx imports fail — so the gate looked green while ~half of
+its 684 tests never collected. The hook now requires the venv (refuses to push
+with a `make venv` hint if absent), drops `-x` so it reports every failure, and
+excludes only `test_e2e_browser.py` (needs a provisioned chromium; that one is
+`make test-all` territory).
+
 To bypass temporarily (e.g. when you mean to commit a legitimate reference):
 ```bash
 git commit --no-verify -m "message"

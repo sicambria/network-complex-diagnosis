@@ -52,6 +52,9 @@ def register(app, state):
             if latency is not None:
                 lat_score = max(1, 100 - max(0, latency - 10) * 2)
                 health = (health + lat_score) // 2 if wifi and wifi.get("signal_dbm") is not None else lat_score
+            # latency (rtt_ms) is a float, so health can be e.g. 73.0; the rest of
+            # the app (health_score()) emits an int — keep this path consistent.
+            health = round(health)
             rt.log.info("poll ok sig=%s lat=%s health=%s",
                         wifi.get("signal_dbm") if wifi else None, latency, health)
             return JSONResponse(content={
