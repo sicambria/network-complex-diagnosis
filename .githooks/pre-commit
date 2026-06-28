@@ -25,8 +25,14 @@ while IFS= read -r -d '' file; do
     if [ ! -f "$file" ]; then
         continue
     fi
-    # Skip hook files — they naturally contain sensitive patterns as detection logic
-    case "$file" in .githooks/*) continue ;; esac
+    # Skip files that legitimately CATALOG the sensitive patterns as their
+    # subject matter: the hooks (detection logic) and the two guide docs whose
+    # "Git Guardrails" sections list the very patterns (gho_/ghp_/AKIA/hostname).
+    # Without this exemption these files can never be committed once the hooks
+    # are active, which only trains people to habitually --no-verify (worse).
+    case "$file" in
+        .githooks/*|AGENTS.md|CLAUDE.md) continue ;;
+    esac
     for pattern in "${SENSITIVE_PATTERNS[@]}"; do
         if git show ":$file" 2>/dev/null | grep -q "$pattern"; then
             echo -e "${RED}[BLOCKED]${NC} $file contains sensitive pattern: $pattern"

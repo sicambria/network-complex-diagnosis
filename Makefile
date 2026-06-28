@@ -1,5 +1,5 @@
 .PHONY: all install install-sys install-gui desktop-install test venv gui daemon run clean lint \
-        e2e e2e-browser e2e-stress e2e-smoke install-e2e e2e-req dev-setup test-all check-js
+        e2e e2e-browser e2e-stress e2e-smoke install-e2e e2e-req dev-setup test-all check-js hooks
 
 PYTHON := python3
 SCRIPT := netdiag.py
@@ -13,7 +13,7 @@ all: install
 
 # -- One-click setup -----------------------------------------------------------
 
-install: install-sys install-gui desktop-install
+install: install-sys install-gui desktop-install hooks
 	chmod +x $(SCRIPT)
 	mkdir -p $(HISTDIR)
 	@echo ""
@@ -54,6 +54,13 @@ venv:
 	. $(VENV)/bin/activate && pip install --quiet fastapi uvicorn pytest httpx
 	@echo "Virtual env ready: source $(VENV)/bin/activate"
 
+# Activate the repo's pre-commit/pre-push gates. Without this, .githooks/ is
+# inert and pushes ship untested — git only honors hooks once core.hooksPath
+# points at the dir. Idempotent; safe to re-run.
+hooks:
+	git config core.hooksPath .githooks
+	@echo "Git hooks active (core.hooksPath -> .githooks)."
+
 # -- Development ----------------------------------------------------------------
 
 test:
@@ -61,7 +68,7 @@ test:
 
 # One-shot: install EVERYTHING needed to develop and fully test (system tools,
 # venv + all dev/test deps, Playwright browser + OS libs, node check).
-dev-setup:
+dev-setup: hooks
 	bash setup/dev-setup.sh $(ARGS)
 
 # The complete suite, including the Playwright browser e2e. Requires dev-setup.

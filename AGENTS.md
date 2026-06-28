@@ -296,6 +296,7 @@ Python only.
 | `install-gui` | fastapi + uvicorn via pip |
 | `desktop-install` | Start menu + desktop icon (all platforms) |
 | `venv` | Python virtual environment with dev deps |
+| `hooks` | Activate the pre-commit/pre-push gates (`core.hooksPath -> .githooks`) |
 | `test` | Run pytest, unit + integration, no browser (pass ARGS="-k diagnose") |
 | `test-all` | Complete suite incl. the Playwright browser e2e |
 | `check-js` | `node --check` on the split frontend JS |
@@ -352,7 +353,11 @@ Pre-commit and pre-push hooks in `.githooks/` block commits containing:
 - API tokens / secrets (`gho_`, `ghp_`, `sk-`, `AKIA`, etc.)
 - Unintentionally large text files (>1 MB)
 
-The hooks are auto-activated via `git config core.hooksPath .githooks` (set globally or per-repo).
+**The hooks are NOT active until `core.hooksPath` points at `.githooks`** — git
+ignores the dir otherwise, so a fresh clone ships untested by default (this is
+exactly how the hollow-gate bug went unnoticed). Wire it up with `make hooks`
+(also run by `make install` / `make dev-setup`), or manually:
+`git config core.hooksPath .githooks`. Verify with `git config core.hooksPath`.
 
 **Pre-push runs the FULL suite via `.venv/bin/python`, never bare `python3`.**
 Test deps (fastapi/uvicorn/httpx/pytest) are PEP-668-blocked system-wide and
